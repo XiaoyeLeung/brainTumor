@@ -1,60 +1,75 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Sequence
 from pathlib import Path
 
 import pandas as pd
 import torch
-from metrics import classification_scores
-from models import build_resnet18_classifier, set_resnet_backbone_trainable
-from PIL import Image
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from torch import nn
 from torch.optim import AdamW
-from torch.utils.data import DataLoader, Dataset
-from training_utils import (
-    add_common_training_arguments,
-    build_data_loaders,
+from torch.utils.data import DataLoader
+
+from data import (
+    CLASS_NAMES,
+    ClassificationDataset,
+    build_train_validation_loaders,
+    build_classification_transforms,
+    load_classification_frames,
+)
+from models import (
+    build_resnet18_classifier,
+    set_resnet_backbone_trainable,
+)
+from runtime import (
     prepare_run,
     save_run_outputs,
     seed_everything,
     select_device,
-    validate_split_columns,
+    validate_run_name,
 )
-from torchvision import transforms
 
-CLASS_NAMES = ("glioma", "meningioma", "no_tumor", "pituitary")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-class ClassificationDataset(Dataset):
-    def __init__(
-        self,
-        frame: pd.DataFrame,
-        data_root: Path,
-        transform: transforms.Compose,
-    ) -> None:
-        self.frame = frame.reset_index(drop=True)
-        self.data_root = data_root
-        self.transform = transform
-        self.label_to_index = {name: index for index, name in enumerate(CLASS_NAMES)}
-
-    def __len__(self) -> int:
-        return len(self.frame)
-
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, int]:
-        row = self.frame.iloc[index]
-        relative_path = Path(str(row["relative_path"]).replace("\\", "/"))
-        with Image.open(self.data_root / relative_path) as image:
-            tensor = self.transform(image.convert("RGB"))
-        return tensor, self.label_to_index[row["tumor_label"]]
+def classification_scores(
+    targets: Sequence[int],
+    predictions: Sequence[int],
+) -> dict[str, float]:
+    return {
+        "accuracy": float(accuracy_score(targets, predictions)),
+        "macro_f1": float(
+            f1_score(targets, predictions, average="macro", zero_division=0)
+        ),
+        "macro_precision": float(
+            precision_score(targets, predictions, average="macro", zero_division=0)
+        ),
+        "macro_recall": float(
+            recall_score(targets, predictions, average="macro", zero_division=0)
+        ),
+    }
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    add_common_training_arguments(
-        parser,
-        default_image_size=224,
-        default_batch_size=32,
+    parser.add_argument("--data-root", type=Path, default=PROJECT_ROOT / "brisc2025")
+    parser.add_argument("--split-root", type=Path, default=PROJECT_ROOT / "data")
+    parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "results")
+    parser.add_argument(
+        "--checkpoint-dir", type=Path, default=PROJECT_ROOT / "checkpoints"
     )
+    parser.add_argument("--run-name", type=validate_run_name)
+    parser.add_argument("--image-size", type=int, default=224)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument(
+        "--device",
+        choices=("auto", "cpu", "cuda", "mps"),
+        default="auto",
+    )
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--head-epochs", type=int, default=5)
     parser.add_argument("--fine-tune-epochs", type=int, default=15)
     parser.add_argument("--head-lr", type=float, default=1e-3)
@@ -63,27 +78,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_transforms(image_size: int) -> tuple[transforms.Compose, transforms.Compose]:
-    normalize = transforms.Normalize(
-        mean=(0.485, 0.456, 0.406),
-        std=(0.229, 0.224, 0.225),
-    )
-    train_transform = transforms.Compose(
-        [
-            transforms.Resize((image_size, image_size)),
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomRotation(10),
-            transforms.ToTensor(),
-            normalize,
-        ]
-    )
-    validation_transform = transforms.Compose(
-        [transforms.Resize((image_size, image_size)), transforms.ToTensor(), normalize]
-    )
-    return train_transform, validation_transform
-
-
-def run_epoch(
+def run_classification_epoch(
     model: nn.Module,
     loader: DataLoader,
     criterion: nn.Module,
@@ -124,31 +119,56 @@ def run_epoch(
     return scores
 
 
-def sample_frame(frame: pd.DataFrame, size: int, seed: int) -> pd.DataFrame:
-    return frame.sample(n=min(size, len(frame)), random_state=seed).reset_index(
-        drop=True
-    )
+def collect_classification_predictions(
+    model: nn.Module,
+    loader: DataLoader,
+    frame: pd.DataFrame,
+    class_names: tuple[str, ...],
+    device: torch.device,
+) -> list[dict[str, object]]:
+    model.eval()
+    predictions: list[dict[str, object]] = []
+    offset = 0
+    no_tumor_index = class_names.index("no_tumor")
+
+    with torch.no_grad():
+        for images, _ in loader:
+            probabilities = torch.softmax(model(images.to(device)), dim=1).cpu()
+            for index, values in enumerate(probabilities):
+                row = frame.iloc[offset + index]
+                prediction = {
+                    "filename": row["filename"],
+                    "relative_path": row["relative_path"],
+                    "tumor_label": row["tumor_label"],
+                    "predicted_class": class_names[int(values.argmax())],
+                    "no_tumor_probability": float(values[no_tumor_index]),
+                    **{
+                        f"probability_{name}": float(values[class_index])
+                        for class_index, name in enumerate(class_names)
+                    },
+                }
+                if "plane_label" in frame:
+                    prediction["plane_label"] = row["plane_label"]
+                predictions.append(prediction)
+            offset += len(images)
+    return predictions
 
 
 def main() -> None:
     args = parse_args()
 
     seed_everything(args.seed)
-    device = select_device()
-    train_frame = pd.read_csv(args.split_root / "classification_train.csv")
-    validation_frame = pd.read_csv(args.split_root / "classification_val.csv")
-    validate_split_columns(
-        train_frame,
-        validation_frame,
-        {"relative_path", "tumor_label"},
-    )
+    device = select_device(args.device)
+    train_frame, validation_frame = load_classification_frames(args.split_root)
 
-    train_transform, validation_transform = build_transforms(args.image_size)
+    train_transform, validation_transform = build_classification_transforms(
+        args.image_size
+    )
     train_dataset = ClassificationDataset(train_frame, args.data_root, train_transform)
     validation_dataset = ClassificationDataset(
         validation_frame, args.data_root, validation_transform
     )
-    train_loader, validation_loader = build_data_loaders(
+    train_loader, validation_loader = build_train_validation_loaders(
         train_dataset,
         validation_dataset,
         batch_size=args.batch_size,
@@ -197,7 +217,7 @@ def main() -> None:
 
         for stage_epoch in range(1, epochs + 1):
             global_epoch += 1
-            train_metrics = run_epoch(
+            train_metrics = run_classification_epoch(
                 model,
                 train_loader,
                 criterion,
@@ -205,7 +225,7 @@ def main() -> None:
                 optimizer=optimizer,
                 head_only=head_only,
             )
-            validation_metrics = run_epoch(
+            validation_metrics = run_classification_epoch(
                 model,
                 validation_loader,
                 criterion,
@@ -248,7 +268,22 @@ def main() -> None:
         "checkpoint": str(run.checkpoint_path),
         "config": config,
     }
-    save_run_outputs(history, summary, run.output_dir)
+    checkpoint = torch.load(
+        run.checkpoint_path,
+        map_location=device,
+        weights_only=True,
+    )
+    model.load_state_dict(checkpoint["model_state_dict"])
+    predictions = collect_classification_predictions(
+        model,
+        validation_loader,
+        validation_dataset.frame,
+        CLASS_NAMES,
+        device,
+    )
+    summary["prediction_split"] = "validation"
+    summary["prediction_count"] = len(predictions)
+    save_run_outputs(history, summary, run.output_dir, predictions)
     print(f"Best validation macro F1={best_f1:.4f} at epoch {best_epoch}")
     print(f"Saved best checkpoint to {run.checkpoint_path}")
 

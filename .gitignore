@@ -2,6 +2,8 @@
 brisc2025/
 checkpoints/
 results/
+tests/
+data/experiments/
 *.pt
 *.pth
 *.ckpt

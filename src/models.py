@@ -25,7 +25,7 @@ def set_resnet_backbone_trainable(model: nn.Module, trainable: bool) -> None:
 
 
 class DoubleConv(nn.Module):
-    """(convolution => [BN] => ReLU) * 2"""
+    """Two convolution, batch-normalization, and ReLU blocks."""
 
     def __init__(self, in_channels, out_channels, mid_channels=None):
         super().__init__()
@@ -45,7 +45,7 @@ class DoubleConv(nn.Module):
 
 
 class Down(nn.Module):
-    """Downscaling with maxpool then double conv"""
+    """Downscale with max pooling, then apply a double convolution."""
 
     def __init__(self, in_channels, out_channels):
         super().__init__()
@@ -58,12 +58,10 @@ class Down(nn.Module):
 
 
 class Up(nn.Module):
-    """Upscaling then double conv"""
+    """Upscale and combine a decoder tensor with its skip connection."""
 
     def __init__(self, in_channels, out_channels, bilinear=True):
         super().__init__()
-
-        # if bilinear, use the normal convolutions to reduce the number of channels
         if bilinear:
             self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
             self.conv = DoubleConv(in_channels, out_channels, in_channels // 2)
@@ -75,26 +73,23 @@ class Up(nn.Module):
 
     def forward(self, x1, x2):
         x1 = self.up(x1)
-        # Inputs use NCHW layout.
-        diffY = x2.size()[2] - x1.size()[2]
-        diffX = x2.size()[3] - x1.size()[3]
-
+        diff_y = x2.size()[2] - x1.size()[2]
+        diff_x = x2.size()[3] - x1.size()[3]
         x1 = F.pad(
             x1,
             [
-                diffX // 2,
-                diffX - diffX // 2,
-                diffY // 2,
-                diffY - diffY // 2,
+                diff_x // 2,
+                diff_x - diff_x // 2,
+                diff_y // 2,
+                diff_y - diff_y // 2,
             ],
         )
-        x = torch.cat([x2, x1], dim=1)
-        return self.conv(x)
+        return self.conv(torch.cat([x2, x1], dim=1))
 
 
 class OutConv(nn.Module):
     def __init__(self, in_channels, out_channels):
-        super(OutConv, self).__init__()
+        super().__init__()
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
 
     def forward(self, x):
@@ -103,7 +98,7 @@ class OutConv(nn.Module):
 
 class UNet(nn.Module):
     def __init__(self, n_channels, n_classes, bilinear=False):
-        super(UNet, self).__init__()
+        super().__init__()
         self.n_channels = n_channels
         self.n_classes = n_classes
         self.bilinear = bilinear
@@ -131,8 +126,7 @@ class UNet(nn.Module):
         x = self._run(self.up2, x, x3)
         x = self._run(self.up3, x, x2)
         x = self._run(self.up4, x, x1)
-        logits = self._run(self.outc, x)
-        return logits
+        return self._run(self.outc, x)
 
     def _run(self, module, *inputs):
         if self.checkpointing and self.training:
@@ -141,3 +135,108 @@ class UNet(nn.Module):
 
     def use_checkpointing(self):
         self.checkpointing = True
+
+
+class ResNet18Encoder(nn.Module):
+    """ResNet18 feature extractor exposing maps for decoder skip connections."""
+
+    output_channels = (64, 64, 128, 256, 512)
+
+    def __init__(self, pretrained: bool = True) -> None:
+        super().__init__()
+        weights = ResNet18_Weights.DEFAULT if pretrained else None
+        backbone = resnet18(weights=weights)
+
+        self.stem = nn.Sequential(backbone.conv1, backbone.bn1, backbone.relu)
+        self.maxpool = backbone.maxpool
+        self.layer1 = backbone.layer1
+        self.layer2 = backbone.layer2
+        self.layer3 = backbone.layer3
+        self.layer4 = backbone.layer4
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        stem = self.stem(x)
+        layer1 = self.layer1(self.maxpool(stem))
+        layer2 = self.layer2(layer1)
+        layer3 = self.layer3(layer2)
+        layer4 = self.layer4(layer3)
+        return stem, layer1, layer2, layer3, layer4
+
+
+class DecoderBlock(nn.Module):
+    """Upsample a feature map and fuse it with an encoder skip connection."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        skip_channels: int,
+        out_channels: int,
+    ) -> None:
+        super().__init__()
+        self.conv = DoubleConv(in_channels + skip_channels, out_channels)
+
+    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        x = F.interpolate(
+            x,
+            size=skip.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        return self.conv(torch.cat((x, skip), dim=1))
+
+
+class MultiTaskResNetUNet(nn.Module):
+    """Optional shared ResNet18 encoder with two task-specific heads."""
+
+    def __init__(
+        self,
+        num_classes: int = 4,
+        segmentation_channels: int = 1,
+        pretrained: bool = True,
+    ) -> None:
+        super().__init__()
+        self.encoder = ResNet18Encoder(pretrained=pretrained)
+
+        self.classifier_pool = nn.AdaptiveAvgPool2d(1)
+        self.classifier = nn.Linear(512, num_classes)
+
+        self.decoder4 = DecoderBlock(512, 256, 256)
+        self.decoder3 = DecoderBlock(256, 128, 128)
+        self.decoder2 = DecoderBlock(128, 64, 64)
+        self.decoder1 = DecoderBlock(64, 64, 64)
+        self.segmentation_refine = DoubleConv(64, 32)
+        self.segmentation_head = OutConv(32, segmentation_channels)
+        self._encoder_trainable = True
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        input_size = x.shape[-2:]
+        stem, layer1, layer2, layer3, layer4 = self.encoder(x)
+
+        pooled = self.classifier_pool(layer4).flatten(1)
+        class_logits = self.classifier(pooled)
+
+        decoded = self.decoder4(layer4, layer3)
+        decoded = self.decoder3(decoded, layer2)
+        decoded = self.decoder2(decoded, layer1)
+        decoded = self.decoder1(decoded, stem)
+        decoded = F.interpolate(
+            decoded,
+            size=input_size,
+            mode="bilinear",
+            align_corners=False,
+        )
+        mask_logits = self.segmentation_head(self.segmentation_refine(decoded))
+        return class_logits, mask_logits
+
+    def train(self, mode: bool = True) -> MultiTaskResNetUNet:
+        super().train(mode)
+        if mode and not self._encoder_trainable:
+            self.encoder.eval()
+        return self
+
+    def set_encoder_trainable(self, trainable: bool) -> None:
+        self._encoder_trainable = trainable
+        for parameter in self.encoder.parameters():
+            parameter.requires_grad = trainable
+        if not trainable:
+            self.encoder.eval()

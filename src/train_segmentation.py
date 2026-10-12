@@ -1,72 +1,115 @@
 from __future__ import annotations
 
 import argparse
-import os
 from pathlib import Path
 
-os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
-
-import albumentations as A
-import cv2
-import numpy as np
 import pandas as pd
 import torch
-from albumentations.pytorch import ToTensorV2
-from metrics import dice_coefficient, iou_coefficient, segmentation_loss
-from models import UNet
+import torch.nn.functional as F
 from torch.optim import AdamW
-from torch.utils.data import DataLoader, Dataset
-from training_utils import (
-    add_common_training_arguments,
-    build_data_loaders,
+from torch.utils.data import DataLoader
+
+from data import (
+    SegmentationDataset,
+    build_segmentation_transforms,
+    build_train_validation_loaders,
+    load_segmentation_frames,
+)
+from models import UNet
+from runtime import (
     prepare_run,
     save_run_outputs,
     seed_everything,
     select_device,
-    validate_split_columns,
+    validate_run_name,
 )
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-class SegmentationDataset(Dataset):
-    def __init__(
-        self,
-        frame: pd.DataFrame,
-        data_root: Path,
-        transform: A.Compose,
-    ) -> None:
-        self.frame = frame.reset_index(drop=True)
-        self.data_root = data_root
-        self.transform = transform
 
-    def __len__(self) -> int:
-        return len(self.frame)
+def soft_dice_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    smooth: float = 1e-6,
+) -> torch.Tensor:
+    probabilities = torch.sigmoid(logits)
+    dimensions = tuple(range(1, targets.ndim))
+    intersection = (probabilities * targets).sum(dim=dimensions)
+    total = probabilities.sum(dim=dimensions) + targets.sum(dim=dimensions)
+    dice = (2.0 * intersection + smooth) / (total + smooth)
+    return 1.0 - dice.mean()
 
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
-        row = self.frame.iloc[index]
-        image_path = self.data_root / Path(str(row["relative_path"]).replace("\\", "/"))
-        mask_path = self.data_root / Path(
-            str(row["mask_relative_path"]).replace("\\", "/")
+
+def segmentation_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    bce_weight: float = 0.5,
+) -> torch.Tensor:
+    """Combine pixel-wise BCE and soft Dice losses."""
+    bce = F.binary_cross_entropy_with_logits(logits, targets)
+    return bce_weight * bce + (1.0 - bce_weight) * soft_dice_loss(logits, targets)
+
+
+def _binary_overlap(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    threshold: float,
+    metric: str,
+    smooth: float = 1e-6,
+) -> torch.Tensor:
+    predictions = (torch.sigmoid(logits.detach()) >= threshold).float()
+    targets = (targets.detach() >= 0.5).float()
+    dimensions = tuple(range(1, targets.ndim))
+    intersection = (predictions * targets).sum(dim=dimensions)
+
+    if metric == "dice":
+        denominator = predictions.sum(dim=dimensions) + targets.sum(dim=dimensions)
+        scores = (2.0 * intersection + smooth) / (denominator + smooth)
+    else:
+        union = (
+            predictions.sum(dim=dimensions) + targets.sum(dim=dimensions) - intersection
         )
-        image = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
-        mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
-        if image is None:
-            raise FileNotFoundError(f"Could not read image: {image_path}")
-        if mask is None:
-            raise FileNotFoundError(f"Could not read mask: {mask_path}")
+        scores = (intersection + smooth) / (union + smooth)
+    return scores.mean()
 
-        transformed = self.transform(image=image, mask=(mask > 0).astype(np.float32))
-        image_tensor = transformed["image"]
-        mask_tensor = transformed["mask"].float().unsqueeze(0)
-        return image_tensor, mask_tensor
+
+def dice_coefficient(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    threshold: float = 0.5,
+) -> torch.Tensor:
+    """Mean hard Dice score for a batch of binary masks."""
+    return _binary_overlap(logits, targets, threshold, metric="dice")
+
+
+def iou_coefficient(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    threshold: float = 0.5,
+) -> torch.Tensor:
+    """Mean intersection-over-union score for binary masks."""
+    return _binary_overlap(logits, targets, threshold, metric="iou")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    add_common_training_arguments(
-        parser,
-        default_image_size=256,
-        default_batch_size=8,
+    parser.add_argument("--data-root", type=Path, default=PROJECT_ROOT / "brisc2025")
+    parser.add_argument("--split-root", type=Path, default=PROJECT_ROOT / "data")
+    parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "results")
+    parser.add_argument(
+        "--checkpoint-dir", type=Path, default=PROJECT_ROOT / "checkpoints"
     )
+    parser.add_argument("--run-name", type=validate_run_name)
+    parser.add_argument("--image-size", type=int, default=256)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument(
+        "--device",
+        choices=("auto", "cpu", "cuda", "mps"),
+        default="auto",
+    )
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument(
@@ -78,27 +121,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_transforms(image_size: int) -> tuple[A.Compose, A.Compose]:
-    train_transform = A.Compose(
-        [
-            A.Resize(image_size, image_size),
-            A.HorizontalFlip(p=0.5),
-            A.Rotate(limit=10, border_mode=cv2.BORDER_CONSTANT, p=0.5),
-            A.Normalize(mean=(0.5,), std=(0.5,)),
-            ToTensorV2(),
-        ]
-    )
-    validation_transform = A.Compose(
-        [
-            A.Resize(image_size, image_size),
-            A.Normalize(mean=(0.5,), std=(0.5,)),
-            ToTensorV2(),
-        ]
-    )
-    return train_transform, validation_transform
-
-
-def run_epoch(
+def run_segmentation_epoch(
     model: UNet,
     loader: DataLoader,
     device: torch.device,
@@ -107,7 +130,8 @@ def run_epoch(
 ) -> dict[str, float]:
     training = optimizer is not None
     model.train(training)
-    totals = {"loss": 0.0, "dice": 0.0, "iou": 0.0}
+    totals = {"loss": 0.0, "dice": 0.0, "iou": 0.0, "positive_dice": 0.0}
+    positive_count = 0
 
     with torch.set_grad_enabled(training):
         for images, masks in loader:
@@ -130,25 +154,66 @@ def run_epoch(
             totals["iou"] += (
                 iou_coefficient(logits, masks, threshold).item() * batch_size
             )
+            positive = masks.flatten(1).any(dim=1)
+            if positive.any():
+                count = int(positive.sum())
+                totals["positive_dice"] += (
+                    dice_coefficient(logits[positive], masks[positive], threshold).item()
+                    * count
+                )
+                positive_count += count
 
-    return {name: total / len(loader.dataset) for name, total in totals.items()}
+    metrics = {
+        name: total / len(loader.dataset)
+        for name, total in totals.items()
+        if name != "positive_dice"
+    }
+    metrics["positive_dice"] = (
+        totals["positive_dice"] / positive_count if positive_count else 0.0
+    )
+    return metrics
+
+
+def collect_segmentation_predictions(
+    model: UNet,
+    loader: DataLoader,
+    frame: pd.DataFrame,
+    device: torch.device,
+    threshold: float,
+) -> list[dict[str, object]]:
+    model.eval()
+    predictions: list[dict[str, object]] = []
+    offset = 0
+
+    with torch.no_grad():
+        for images, _ in loader:
+            probabilities = torch.sigmoid(model(images.to(device)))
+            areas = (probabilities >= threshold).float().mean(dim=(1, 2, 3)).cpu()
+            for index, area in enumerate(areas):
+                row = frame.iloc[offset + index]
+                prediction = {
+                    "filename": row["filename"],
+                    "relative_path": row["relative_path"],
+                    "tumor_label": row["tumor_label"],
+                    "predicted_mask_area_fraction": float(area),
+                }
+                if "plane_label" in frame:
+                    prediction["plane_label"] = row["plane_label"]
+                predictions.append(prediction)
+            offset += len(images)
+    return predictions
 
 
 def main() -> None:
     args = parse_args()
 
     seed_everything(args.seed)
-    device = select_device()
-    train_frame = pd.read_csv(args.split_root / "segmentation_train.csv")
-    validation_frame = pd.read_csv(args.split_root / "segmentation_val.csv")
+    device = select_device(args.device)
+    train_frame, validation_frame = load_segmentation_frames(args.split_root)
 
-    validate_split_columns(
-        train_frame,
-        validation_frame,
-        {"relative_path", "mask_relative_path"},
+    train_transform, validation_transform = build_segmentation_transforms(
+        args.image_size
     )
-
-    train_transform, validation_transform = build_transforms(args.image_size)
 
     train_dataset = SegmentationDataset(train_frame, args.data_root, train_transform)
 
@@ -158,7 +223,7 @@ def main() -> None:
         validation_transform,
     )
 
-    train_loader, validation_loader = build_data_loaders(
+    train_loader, validation_loader = build_train_validation_loaders(
         train_dataset,
         validation_dataset,
         batch_size=args.batch_size,
@@ -184,7 +249,7 @@ def main() -> None:
         f"Device: {device}; train={len(train_dataset)}, validation={len(validation_dataset)}"
     )
     for epoch in range(1, args.epochs + 1):
-        train_metrics = run_epoch(
+        train_metrics = run_segmentation_epoch(
             model,
             train_loader,
             device,
@@ -192,7 +257,7 @@ def main() -> None:
             optimizer=optimizer,
         )
 
-        validation_metrics = run_epoch(
+        validation_metrics = run_segmentation_epoch(
             model,
             validation_loader,
             device,
@@ -208,19 +273,20 @@ def main() -> None:
         )
         print(
             f"Epoch {epoch:02d}: train loss={train_metrics['loss']:.4f}, "
-            f"Dice={train_metrics['dice']:.4f}; "
+            f"positive Dice={train_metrics['positive_dice']:.4f}; "
             f"val loss={validation_metrics['loss']:.4f}, "
-            f"Dice={validation_metrics['dice']:.4f}, IoU={validation_metrics['iou']:.4f}"
+            f"positive Dice={validation_metrics['positive_dice']:.4f}, "
+            f"all-case Dice={validation_metrics['dice']:.4f}"
         )
 
-        if validation_metrics["dice"] > best_dice:
-            best_dice = validation_metrics["dice"]
+        if validation_metrics["positive_dice"] > best_dice:
+            best_dice = validation_metrics["positive_dice"]
             best_epoch = epoch
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
                     "epoch": epoch,
-                    "val_dice": best_dice,
+                    "val_positive_dice": best_dice,
                     "config": config,
                 },
                 run.checkpoint_path,
@@ -229,12 +295,27 @@ def main() -> None:
     summary = {
         "run_id": run.run_id,
         "best_epoch": best_epoch,
-        "best_val_dice": best_dice,
+        "best_val_positive_dice": best_dice,
         "checkpoint": str(run.checkpoint_path),
         "config": config,
     }
-    save_run_outputs(history, summary, run.output_dir)
-    print(f"Best validation Dice={best_dice:.4f} at epoch {best_epoch}")
+    checkpoint = torch.load(
+        run.checkpoint_path,
+        map_location=device,
+        weights_only=True,
+    )
+    model.load_state_dict(checkpoint["model_state_dict"])
+    predictions = collect_segmentation_predictions(
+        model,
+        validation_loader,
+        validation_dataset.frame,
+        device,
+        args.threshold,
+    )
+    summary["prediction_split"] = "validation"
+    summary["prediction_count"] = len(predictions)
+    save_run_outputs(history, summary, run.output_dir, predictions)
+    print(f"Best validation positive Dice={best_dice:.4f} at epoch {best_epoch}")
     print(f"Saved best checkpoint to {run.checkpoint_path}")
 
 
