@@ -1,0 +1,20 @@
+
+brisc2025/
+checkpoints/
+results/
+*.pt
+*.pth
+*.ckpt
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+env/
+
+# Jupyter and macOS
+.ipynb_checkpoints/
+.DS_Store
+
+# Secrets
+.env

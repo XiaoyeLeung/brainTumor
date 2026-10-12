@@ -1,0 +1,14 @@
+# Python 3.12
+
+albumentations==2.0.8
+numpy==2.5.4
+opencv-python-headless==4.14.0.94
+pandas==3.0.6
+Pillow==12.3.0
+scikit-learn==1.9.1
+torch==2.11.0
+torchvision==0.26.0
+
+
+ipykernel==7.4.0
+matplotlib==3.11.2
