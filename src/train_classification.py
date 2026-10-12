@@ -1,11 +1,8 @@
 from __future__ import annotations
 
 import argparse
-import json
-import random
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import torch
 from metrics import classification_scores
@@ -14,9 +11,17 @@ from PIL import Image
 from torch import nn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
+from training_utils import (
+    add_common_training_arguments,
+    build_data_loaders,
+    prepare_run,
+    save_run_outputs,
+    seed_everything,
+    select_device,
+    validate_split_columns,
+)
 from torchvision import transforms
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CLASS_NAMES = ("glioma", "meningioma", "no_tumor", "pituitary")
 
 
@@ -45,39 +50,17 @@ class ClassificationDataset(Dataset):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-root", type=Path, default=PROJECT_ROOT / "brisc2025")
-    parser.add_argument("--split-root", type=Path, default=PROJECT_ROOT / "data")
-    parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "results")
-    parser.add_argument(
-        "--checkpoint-dir", type=Path, default=PROJECT_ROOT / "checkpoints"
+    add_common_training_arguments(
+        parser,
+        default_image_size=224,
+        default_batch_size=32,
     )
-    parser.add_argument("--image-size", type=int, default=224)
-    parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--head-epochs", type=int, default=5)
     parser.add_argument("--fine-tune-epochs", type=int, default=15)
     parser.add_argument("--head-lr", type=float, default=1e-3)
     parser.add_argument("--fine-tune-lr", type=float, default=1e-4)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-pretrained", action="store_true")
     return parser.parse_args()
-
-
-def seed_everything(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def select_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
 
 
 def build_transforms(image_size: int) -> tuple[transforms.Compose, transforms.Compose]:
@@ -147,13 +130,6 @@ def sample_frame(frame: pd.DataFrame, size: int, seed: int) -> pd.DataFrame:
     )
 
 
-def serializable_config(args: argparse.Namespace) -> dict[str, object]:
-    return {
-        key: str(value) if isinstance(value, Path) else value
-        for key, value in vars(args).items()
-    }
-
-
 def main() -> None:
     args = parse_args()
 
@@ -161,34 +137,24 @@ def main() -> None:
     device = select_device()
     train_frame = pd.read_csv(args.split_root / "classification_train.csv")
     validation_frame = pd.read_csv(args.split_root / "classification_val.csv")
-    required_columns = {"relative_path", "tumor_label"}
-    if missing := required_columns - set(train_frame.columns):
-        raise ValueError(f"Training CSV is missing columns: {sorted(missing)}")
-    if missing := required_columns - set(validation_frame.columns):
-        raise ValueError(f"Validation CSV is missing columns: {sorted(missing)}")
+    validate_split_columns(
+        train_frame,
+        validation_frame,
+        {"relative_path", "tumor_label"},
+    )
 
     train_transform, validation_transform = build_transforms(args.image_size)
     train_dataset = ClassificationDataset(train_frame, args.data_root, train_transform)
     validation_dataset = ClassificationDataset(
         validation_frame, args.data_root, validation_transform
     )
-    loader_options = {
-        "batch_size": args.batch_size,
-        "num_workers": args.num_workers,
-        "pin_memory": device.type == "cuda",
-        "persistent_workers": args.num_workers > 0,
-    }
-    generator = torch.Generator().manual_seed(args.seed)
-    train_loader = DataLoader(
+    train_loader, validation_loader = build_data_loaders(
         train_dataset,
-        shuffle=True,
-        generator=generator,
-        **loader_options,
-    )
-    validation_loader = DataLoader(
         validation_dataset,
-        shuffle=False,
-        **loader_options,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        device=device,
+        seed=args.seed,
     )
 
     model = build_resnet18_classifier(
@@ -201,11 +167,14 @@ def main() -> None:
     best_f1 = -1.0
     best_epoch = 0
     global_epoch = 0
-    config = serializable_config(args)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_path = args.checkpoint_dir / "resnet18_best.ckpt"
+    initialization = "scratch" if args.no_pretrained else "pretrained"
+    description = (
+        f"resnet18-{initialization}_img{args.image_size}_bs{args.batch_size}_"
+        f"headlr{args.head_lr:g}_ftlr{args.fine_tune_lr:g}_seed{args.seed}"
+    )
+    run, config = prepare_run(args, description)
 
+    print(f"Run: {run.run_id}")
     print(
         f"Device: {device}; train={len(train_dataset)}, validation={len(validation_dataset)}"
     )
@@ -269,23 +238,19 @@ def main() -> None:
                         "val_macro_f1": best_f1,
                         "config": config,
                     },
-                    checkpoint_path,
+                    run.checkpoint_path,
                 )
 
-    pd.DataFrame(history).to_csv(
-        args.output_dir / "classification_history.csv",
-        index=False,
-    )
     summary = {
+        "run_id": run.run_id,
         "best_epoch": best_epoch,
         "best_val_macro_f1": best_f1,
-        "checkpoint": str(checkpoint_path),
+        "checkpoint": str(run.checkpoint_path),
         "config": config,
     }
-    with (args.output_dir / "classification_summary.json").open("w") as file:
-        json.dump(summary, file, indent=2)
+    save_run_outputs(history, summary, run.output_dir)
     print(f"Best validation macro F1={best_f1:.4f} at epoch {best_epoch}")
-    print(f"Saved best checkpoint to {checkpoint_path}")
+    print(f"Saved best checkpoint to {run.checkpoint_path}")
 
 
 if __name__ == "__main__":
