@@ -1,6 +1,6 @@
-Dear Chrysi ;)
+Dear my friend Chrysi ;)
 
-How to use github: 
+To use github: 
 ```
 git clone https://github.com/XiaoyeLeung/brainTumor.git
 cd brainTumor
@@ -22,3 +22,5 @@ brainTumor/
 
 
 Official test data must remain untouched.
+
+HAVE A NICE DAY!!!
