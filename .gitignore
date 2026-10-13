@@ -12,6 +12,7 @@ data/experiments/
 __pycache__/
 *.py[cod]
 .venv/
+.venv-cloud/
 env/
 
 # Jupyter and macOS
@@ -20,4 +21,6 @@ env/
 
 # Secrets
 .env
-.md
+*.md
+cloud_artifacts/
+.firecrawl/
