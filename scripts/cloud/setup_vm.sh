@@ -5,9 +5,13 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${PROJECT_ROOT}"
 
-python3 -m venv --system-site-packages .venv-cloud
+python3 -m venv .venv-cloud
 source .venv-cloud/bin/activate
 python -m pip install --upgrade pip
+python -m pip install --no-cache-dir \
+    torch==2.11.0 \
+    torchvision==0.26.0 \
+    --index-url https://download.pytorch.org/whl/cu128
 python -m pip install -r requirements-cloud.txt
 
 python -c 'import torch, torchvision; assert torch.cuda.is_available(), "CUDA is unavailable"; print(f"torch={torch.__version__}, torchvision={torchvision.__version__}, GPU={torch.cuda.get_device_name(0)}")'
