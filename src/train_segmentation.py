@@ -118,7 +118,19 @@ def parse_args() -> argparse.Namespace:
         help="Use bilinear upsampling instead of transposed convolutions.",
     )
     parser.add_argument("--threshold", type=float, default=0.5)
-    return parser.parse_args()
+    parser.add_argument(
+        "--earlyStopping",
+        dest="early_stopping",
+        nargs="?",
+        const=5,
+        type=int,
+        metavar="PATIENCE",
+        help="Stop after PATIENCE non-improving validation epochs (default: 5).",
+    )
+    args = parser.parse_args()
+    if args.early_stopping is not None and args.early_stopping < 1:
+        parser.error("--earlyStopping PATIENCE must be at least 1")
+    return args
 
 
 def run_segmentation_epoch(
@@ -186,16 +198,38 @@ def collect_segmentation_predictions(
     offset = 0
 
     with torch.no_grad():
-        for images, _ in loader:
+        for images, masks in loader:
             probabilities = torch.sigmoid(model(images.to(device)))
-            areas = (probabilities >= threshold).float().mean(dim=(1, 2, 3)).cpu()
-            for index, area in enumerate(areas):
+            predicted_masks = probabilities >= threshold
+            target_masks = masks.to(device) >= 0.5
+            dimensions = (1, 2, 3)
+            intersection = (predicted_masks & target_masks).sum(dim=dimensions).float()
+            predicted_area = predicted_masks.sum(dim=dimensions).float()
+            target_area = target_masks.sum(dim=dimensions).float()
+            union = predicted_area + target_area - intersection
+            dice = (2.0 * intersection + 1e-6) / (
+                predicted_area + target_area + 1e-6
+            )
+            iou = (intersection + 1e-6) / (union + 1e-6)
+            areas = predicted_masks.float().mean(dim=dimensions)
+            target_areas = target_masks.float().mean(dim=dimensions)
+            batch_metrics = zip(
+                areas.cpu(),
+                target_areas.cpu(),
+                dice.cpu(),
+                iou.cpu(),
+            )
+            for index, metrics in enumerate(batch_metrics):
+                area, target_area_fraction, sample_dice, sample_iou = metrics
                 row = frame.iloc[offset + index]
                 prediction = {
                     "filename": row["filename"],
                     "relative_path": row["relative_path"],
                     "tumor_label": row["tumor_label"],
                     "predicted_mask_area_fraction": float(area),
+                    "ground_truth_mask_area_fraction": float(target_area_fraction),
+                    "mask_dice": float(sample_dice),
+                    "mask_iou": float(sample_iou),
                 }
                 if "plane_label" in frame:
                     prediction["plane_label"] = row["plane_label"]
@@ -237,6 +271,7 @@ def main() -> None:
     history: list[dict[str, float | int]] = []
     best_dice = -1.0
     best_epoch = 0
+    epochs_without_improvement = 0
     upsampling = "bilinear" if args.bilinear else "transposed"
     description = (
         f"unet-{upsampling}_img{args.image_size}_"
@@ -282,6 +317,7 @@ def main() -> None:
         if validation_metrics["positive_dice"] > best_dice:
             best_dice = validation_metrics["positive_dice"]
             best_epoch = epoch
+            epochs_without_improvement = 0
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
@@ -291,11 +327,25 @@ def main() -> None:
                 },
                 run.checkpoint_path,
             )
+        else:
+            epochs_without_improvement += 1
+
+        if (
+            args.early_stopping is not None
+            and epochs_without_improvement >= args.early_stopping
+        ):
+            print(
+                f"Early stopping after {args.early_stopping} epochs without "
+                "validation positive-Dice improvement."
+            )
+            break
 
     summary = {
         "run_id": run.run_id,
         "best_epoch": best_epoch,
         "best_val_positive_dice": best_dice,
+        "epochs_completed": len(history),
+        "early_stopping_patience": args.early_stopping,
         "checkpoint": str(run.checkpoint_path),
         "config": config,
     }

@@ -75,7 +75,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--head-lr", type=float, default=1e-3)
     parser.add_argument("--fine-tune-lr", type=float, default=1e-4)
     parser.add_argument("--no-pretrained", action="store_true")
-    return parser.parse_args()
+    parser.add_argument(
+        "--earlyStopping",
+        dest="early_stopping",
+        nargs="?",
+        const=5,
+        type=int,
+        metavar="PATIENCE",
+        help="Stop a training stage after PATIENCE non-improving validation epochs (default: 5).",
+    )
+    args = parser.parse_args()
+    if args.early_stopping is not None and args.early_stopping < 1:
+        parser.error("--earlyStopping PATIENCE must be at least 1")
+    return args
 
 
 def run_classification_epoch(
@@ -205,6 +217,8 @@ def main() -> None:
     for stage, epochs, learning_rate, head_only in stages:
         if epochs == 0:
             continue
+        stage_best_f1 = -1.0
+        epochs_without_improvement = 0
         set_resnet_backbone_trainable(model, trainable=not head_only)
         trainable_parameters = [
             parameter for parameter in model.parameters() if parameter.requires_grad
@@ -261,10 +275,28 @@ def main() -> None:
                     run.checkpoint_path,
                 )
 
+            if validation_metrics["macro_f1"] > stage_best_f1:
+                stage_best_f1 = validation_metrics["macro_f1"]
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+
+            if (
+                args.early_stopping is not None
+                and epochs_without_improvement >= args.early_stopping
+            ):
+                print(
+                    f"Early stopping {stage} after {args.early_stopping} "
+                    "epochs without validation macro-F1 improvement."
+                )
+                break
+
     summary = {
         "run_id": run.run_id,
         "best_epoch": best_epoch,
         "best_val_macro_f1": best_f1,
+        "epochs_completed": global_epoch,
+        "early_stopping_patience": args.early_stopping,
         "checkpoint": str(run.checkpoint_path),
         "config": config,
     }
