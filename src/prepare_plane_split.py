@@ -51,11 +51,14 @@ def build_experiment_split(
     if not 0.0 < validation_fraction < 1.0:
         raise ValueError("validation_fraction must be between 0 and 1")
 
-    development = frame.loc[frame["official_split"] == "train"]
+    official_train = frame.loc[frame["official_split"] == "train"]
+    development = official_train
     test = frame.loc[frame["official_split"] == "test"]
     if held_out_plane != "none":
-        development = development.loc[development["plane_label"] != held_out_plane]
-        test = test.loc[test["plane_label"] == held_out_plane]
+        development = official_train.loc[
+            official_train["plane_label"] != held_out_plane
+        ]
+        test = official_train.loc[official_train["plane_label"] == held_out_plane]
 
     strata = development["tumor_label"] + "|" + development["plane_label"]
     train, validation = train_test_split(
@@ -118,6 +121,11 @@ def main() -> None:
         f"Saved {output_path}: train={counts.get('train', 0)}, "
         f"validation={counts.get('validation', 0)}, test={counts.get('test', 0)}"
     )
+    if args.held_out_plane != "none":
+        print(
+            "LOPO evaluation uses held-out official-training rows; "
+            "official-test rows are excluded."
+        )
 
 
 if __name__ == "__main__":

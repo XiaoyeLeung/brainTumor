@@ -5,6 +5,11 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${PROJECT_ROOT}"
 
+if ! python3 -c "import ensurepip" >/dev/null 2>&1; then
+    sudo apt-get update
+    sudo apt-get install -y python3.12-venv
+fi
+
 python3 -m venv .venv-cloud
 source .venv-cloud/bin/activate
 python -m pip install --upgrade pip
