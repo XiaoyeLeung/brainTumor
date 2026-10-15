@@ -105,23 +105,69 @@ def build_segmentation_transforms(image_size: int) -> tuple[object, object]:
     import cv2
     from albumentations.pytorch import ToTensorV2
 
-    train_transform = A.Compose(
+    # train_transform = A.Compose(
+    #     [
+    #         A.Resize(image_size, image_size),
+    #         A.HorizontalFlip(p=0.5),
+    #         A.Rotate(limit=10, border_mode=cv2.BORDER_CONSTANT, p=0.5),
+    #         A.Normalize(mean=(0.5,), std=(0.5,)),
+    #         ToTensorV2(),
+    #     ]
+    # )
+    # validation_transform = A.Compose(
+    #     [
+    #         A.Resize(image_size, image_size),
+    #         A.Normalize(mean=(0.5,), std=(0.5,)),
+    #         ToTensorV2(),
+    #     ]
+    # )
+
+    train_transform2 = A.Compose(
         [
             A.Resize(image_size, image_size),
             A.HorizontalFlip(p=0.5),
-            A.Rotate(limit=10, border_mode=cv2.BORDER_CONSTANT, p=0.5),
+            A.Affine(
+                scale=(0.90, 1.10),
+                translate_percent=(-0.05, 0.05),
+                rotate=(-15, 15),
+                shear=(-3, 3),
+                interpolation=cv2.INTER_LINEAR,
+                mask_interpolation=cv2.INTER_NEAREST,
+                border_mode=cv2.BORDER_CONSTANT,
+                fill=0,
+                fill_mask=0,
+                p=0.7,
+            ),
+            A.OneOf(
+                [
+                    A.RandomBrightnessContrast(
+                        brightness_limit=0.15,
+                        contrast_limit=0.15,
+                        p=1.0,
+                    ),
+                    A.RandomGamma(gamma_limit=(85, 115), p=1.0),
+                ],
+                p=0.5,
+            ),
+            A.OneOf(
+                [
+                    A.GaussNoise(std_range=(0.01, 0.03), p=1.0),
+                    A.GaussianBlur(blur_limit=(3, 5), p=1.0),
+                ],
+                p=0.15,
+            ),
             A.Normalize(mean=(0.5,), std=(0.5,)),
             ToTensorV2(),
         ]
     )
-    validation_transform = A.Compose(
+    validation_transform2 = A.Compose(
         [
             A.Resize(image_size, image_size),
             A.Normalize(mean=(0.5,), std=(0.5,)),
             ToTensorV2(),
         ]
     )
-    return train_transform, validation_transform
+    return train_transform2, validation_transform2
 
 
 def load_classification_frame(split_root: Path, split: str) -> pd.DataFrame:
