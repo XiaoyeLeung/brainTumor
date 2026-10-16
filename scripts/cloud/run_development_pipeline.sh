@@ -16,6 +16,10 @@ PATIENCE="${BRAINTUMOR_EARLY_STOPPING_PATIENCE:-5}"
 HEAD_EPOCHS="${BRAINTUMOR_CLASSIFICATION_HEAD_EPOCHS:-2}"
 FINE_TUNE_EPOCHS="${BRAINTUMOR_CLASSIFICATION_FINE_TUNE_EPOCHS:-30}"
 SEGMENTATION_EPOCHS="${BRAINTUMOR_SEGMENTATION_EPOCHS:-30}"
+SEGMENTATION_FP_WEIGHT="${BRAINTUMOR_SEGMENTATION_FP_WEIGHT:-0.7}"
+EMPTY_MASK_WEIGHT="${BRAINTUMOR_EMPTY_MASK_WEIGHT:-2.0}"
+MIN_COMPONENT_PIXELS="${BRAINTUMOR_MIN_COMPONENT_PIXELS:-64}"
+NO_TUMOR_GATE_THRESHOLD="${BRAINTUMOR_NO_TUMOR_GATE_THRESHOLD:-0.9}"
 NUM_WORKERS="${BRAINTUMOR_NUM_WORKERS:-4}"
 export PYTHONUNBUFFERED=1
 
@@ -79,6 +83,9 @@ fi
     --image-size 256 \
     --batch-size 8 \
     --epochs "${SEGMENTATION_EPOCHS}" \
+    --false-positive-weight "${SEGMENTATION_FP_WEIGHT}" \
+    --empty-mask-weight "${EMPTY_MASK_WEIGHT}" \
+    --selection-metric balanced_dice \
     --earlyStopping "${PATIENCE}" \
     --num-workers "${NUM_WORKERS}" \
     --device cuda \
@@ -99,6 +106,9 @@ fi
     --split validation \
     --split-root "${SPLIT_ROOT}" \
     --output-dir "${PREDICTION_ROOT}/segmentation_validation" \
+    --classification-run "${PREDICTION_ROOT}/classification_validation/run.json" \
+    --min-component-pixels "${MIN_COMPONENT_PIXELS}" \
+    --no-tumor-gate-threshold "${NO_TUMOR_GATE_THRESHOLD}" \
     --num-workers "${NUM_WORKERS}" \
     --device cuda
 

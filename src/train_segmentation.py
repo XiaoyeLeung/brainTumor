@@ -23,6 +23,10 @@ from runtime import (
     select_device,
     validate_run_name,
 )
+from segmentation_postprocessing import (
+    SegmentationPostprocessConfig,
+    postprocess_masks,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -40,14 +44,54 @@ def soft_dice_loss(
     return 1.0 - dice.mean()
 
 
+def soft_tversky_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    false_positive_weight: float = 0.7,
+    smooth: float = 1e-6,
+) -> torch.Tensor:
+    """Asymmetric overlap loss with extra weight on false-positive pixels."""
+    if not 0.0 <= false_positive_weight <= 1.0:
+        raise ValueError("false_positive_weight must be in [0, 1]")
+    probabilities = torch.sigmoid(logits)
+    dimensions = tuple(range(1, targets.ndim))
+    true_positive = (probabilities * targets).sum(dim=dimensions)
+    false_positive = (probabilities * (1.0 - targets)).sum(dim=dimensions)
+    false_negative = ((1.0 - probabilities) * targets).sum(dim=dimensions)
+    false_negative_weight = 1.0 - false_positive_weight
+    score = (true_positive + smooth) / (
+        true_positive
+        + false_positive_weight * false_positive
+        + false_negative_weight * false_negative
+        + smooth
+    )
+    return 1.0 - score.mean()
+
+
 def segmentation_loss(
     logits: torch.Tensor,
     targets: torch.Tensor,
     bce_weight: float = 0.5,
+    false_positive_weight: float = 0.7,
+    empty_mask_weight: float = 2.0,
 ) -> torch.Tensor:
-    """Combine pixel-wise BCE and soft Dice losses."""
-    bce = F.binary_cross_entropy_with_logits(logits, targets)
-    return bce_weight * bce + (1.0 - bce_weight) * soft_dice_loss(logits, targets)
+    """Combine empty-mask-weighted BCE and false-positive-aware Tversky loss."""
+    if not 0.0 <= bce_weight <= 1.0:
+        raise ValueError("bce_weight must be in [0, 1]")
+    if empty_mask_weight < 1.0:
+        raise ValueError("empty_mask_weight must be at least 1")
+
+    pixel_bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+    sample_bce = pixel_bce.flatten(1).mean(dim=1)
+    empty_masks = ~targets.flatten(1).bool().any(dim=1)
+    sample_weights = torch.where(
+        empty_masks,
+        torch.full_like(sample_bce, empty_mask_weight),
+        torch.ones_like(sample_bce),
+    )
+    weighted_bce = (sample_bce * sample_weights).mean()
+    overlap = soft_tversky_loss(logits, targets, false_positive_weight)
+    return bce_weight * weighted_bce + (1.0 - bce_weight) * overlap
 
 
 def _binary_overlap(
@@ -119,6 +163,30 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument(
+        "--bce-weight",
+        type=float,
+        default=0.5,
+        help="Contribution of BCE to the combined segmentation loss.",
+    )
+    parser.add_argument(
+        "--false-positive-weight",
+        type=float,
+        default=0.7,
+        help="Tversky weight for false positives; values above 0.5 penalize them more.",
+    )
+    parser.add_argument(
+        "--empty-mask-weight",
+        type=float,
+        default=2.0,
+        help="BCE multiplier for no-tumor training images.",
+    )
+    parser.add_argument(
+        "--selection-metric",
+        choices=("positive_dice", "balanced_dice"),
+        default="balanced_dice",
+        help="Validation metric used for checkpoint selection and early stopping.",
+    )
+    parser.add_argument(
         "--earlyStopping",
         dest="early_stopping",
         nargs="?",
@@ -130,6 +198,14 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.early_stopping is not None and args.early_stopping < 1:
         parser.error("--earlyStopping PATIENCE must be at least 1")
+    if not 0.0 <= args.threshold <= 1.0:
+        parser.error("--threshold must be in [0, 1]")
+    if not 0.0 <= args.bce_weight <= 1.0:
+        parser.error("--bce-weight must be in [0, 1]")
+    if not 0.0 <= args.false_positive_weight <= 1.0:
+        parser.error("--false-positive-weight must be in [0, 1]")
+    if args.empty_mask_weight < 1.0:
+        parser.error("--empty-mask-weight must be at least 1")
     return args
 
 
@@ -139,11 +215,23 @@ def run_segmentation_epoch(
     device: torch.device,
     threshold: float,
     optimizer: AdamW | None = None,
+    *,
+    bce_weight: float = 0.5,
+    false_positive_weight: float = 0.7,
+    empty_mask_weight: float = 2.0,
 ) -> dict[str, float]:
     training = optimizer is not None
     model.train(training)
-    totals = {"loss": 0.0, "dice": 0.0, "iou": 0.0, "positive_dice": 0.0}
+    totals = {
+        "loss": 0.0,
+        "dice": 0.0,
+        "iou": 0.0,
+        "positive_dice": 0.0,
+        "empty_specificity": 0.0,
+        "empty_predicted_area": 0.0,
+    }
     positive_count = 0
+    empty_count = 0
 
     with torch.set_grad_enabled(training):
         for images, masks in loader:
@@ -153,7 +241,13 @@ def run_segmentation_epoch(
                 optimizer.zero_grad(set_to_none=True)
 
             logits = model(images)
-            loss = segmentation_loss(logits, masks)
+            loss = segmentation_loss(
+                logits,
+                masks,
+                bce_weight=bce_weight,
+                false_positive_weight=false_positive_weight,
+                empty_mask_weight=empty_mask_weight,
+            )
             if training:
                 loss.backward()
                 optimizer.step()
@@ -174,15 +268,37 @@ def run_segmentation_epoch(
                     * count
                 )
                 positive_count += count
+            empty = ~positive
+            if empty.any():
+                empty_predictions = (
+                    torch.sigmoid(logits.detach()[empty]) >= threshold
+                ).flatten(1)
+                count = int(empty.sum())
+                totals["empty_specificity"] += float(
+                    (~empty_predictions.any(dim=1)).sum()
+                )
+                totals["empty_predicted_area"] += float(
+                    empty_predictions.float().mean(dim=1).sum()
+                )
+                empty_count += count
 
     metrics = {
         name: total / len(loader.dataset)
         for name, total in totals.items()
-        if name != "positive_dice"
+        if name not in {"positive_dice", "empty_specificity", "empty_predicted_area"}
     }
     metrics["positive_dice"] = (
         totals["positive_dice"] / positive_count if positive_count else 0.0
     )
+    metrics["empty_specificity"] = (
+        totals["empty_specificity"] / empty_count if empty_count else 1.0
+    )
+    metrics["empty_predicted_area"] = (
+        totals["empty_predicted_area"] / empty_count if empty_count else 0.0
+    )
+    metrics["balanced_dice"] = (
+        metrics["positive_dice"] + metrics["empty_specificity"]
+    ) / 2.0
     return metrics
 
 
@@ -192,15 +308,28 @@ def collect_segmentation_predictions(
     frame: pd.DataFrame,
     device: torch.device,
     threshold: float,
+    postprocess_config: SegmentationPostprocessConfig | None = None,
+    no_tumor_probabilities: list[float] | None = None,
 ) -> list[dict[str, object]]:
     model.eval()
     predictions: list[dict[str, object]] = []
     offset = 0
+    config = postprocess_config or SegmentationPostprocessConfig()
 
     with torch.no_grad():
         for images, masks in loader:
             probabilities = torch.sigmoid(model(images.to(device)))
-            predicted_masks = probabilities >= threshold
+            raw_masks = probabilities >= threshold
+            batch_probabilities = (
+                no_tumor_probabilities[offset : offset + len(images)]
+                if no_tumor_probabilities is not None
+                else None
+            )
+            predicted_masks, postprocess_metadata = postprocess_masks(
+                raw_masks,
+                config,
+                batch_probabilities,
+            )
             target_masks = masks.to(device) >= 0.5
             dimensions = (1, 2, 3)
             intersection = (predicted_masks & target_masks).sum(dim=dimensions).float()
@@ -230,6 +359,7 @@ def collect_segmentation_predictions(
                     "ground_truth_mask_area_fraction": float(target_area_fraction),
                     "mask_dice": float(sample_dice),
                     "mask_iou": float(sample_iou),
+                    **postprocess_metadata[index],
                 }
                 if "plane_label" in frame:
                     prediction["plane_label"] = row["plane_label"]
@@ -269,7 +399,7 @@ def main() -> None:
     model = UNet(n_channels=1, n_classes=1, bilinear=args.bilinear).to(device)
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     history: list[dict[str, float | int]] = []
-    best_dice = -1.0
+    best_score = -1.0
     best_epoch = 0
     epochs_without_improvement = 0
     upsampling = "bilinear" if args.bilinear else "transposed"
@@ -290,6 +420,9 @@ def main() -> None:
             device,
             args.threshold,
             optimizer=optimizer,
+            bce_weight=args.bce_weight,
+            false_positive_weight=args.false_positive_weight,
+            empty_mask_weight=args.empty_mask_weight,
         )
 
         validation_metrics = run_segmentation_epoch(
@@ -297,6 +430,9 @@ def main() -> None:
             validation_loader,
             device,
             args.threshold,
+            bce_weight=args.bce_weight,
+            false_positive_weight=args.false_positive_weight,
+            empty_mask_weight=args.empty_mask_weight,
         )
 
         history.append(
@@ -311,18 +447,23 @@ def main() -> None:
             f"positive Dice={train_metrics['positive_dice']:.4f}; "
             f"val loss={validation_metrics['loss']:.4f}, "
             f"positive Dice={validation_metrics['positive_dice']:.4f}, "
-            f"all-case Dice={validation_metrics['dice']:.4f}"
+            f"empty specificity={validation_metrics['empty_specificity']:.4f}, "
+            f"balanced Dice={validation_metrics['balanced_dice']:.4f}"
         )
 
-        if validation_metrics["positive_dice"] > best_dice:
-            best_dice = validation_metrics["positive_dice"]
+        selection_score = validation_metrics[args.selection_metric]
+        if selection_score > best_score:
+            best_score = selection_score
             best_epoch = epoch
             epochs_without_improvement = 0
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
                     "epoch": epoch,
-                    "val_positive_dice": best_dice,
+                    "val_positive_dice": validation_metrics["positive_dice"],
+                    "val_metrics": validation_metrics,
+                    "selection_metric": args.selection_metric,
+                    "selection_score": selection_score,
                     "config": config,
                 },
                 run.checkpoint_path,
@@ -336,24 +477,29 @@ def main() -> None:
         ):
             print(
                 f"Early stopping after {args.early_stopping} epochs without "
-                "validation positive-Dice improvement."
+                f"validation {args.selection_metric} improvement."
             )
             break
 
-    summary = {
-        "run_id": run.run_id,
-        "best_epoch": best_epoch,
-        "best_val_positive_dice": best_dice,
-        "epochs_completed": len(history),
-        "early_stopping_patience": args.early_stopping,
-        "checkpoint": str(run.checkpoint_path),
-        "config": config,
-    }
     checkpoint = torch.load(
         run.checkpoint_path,
         map_location=device,
         weights_only=True,
     )
+    best_metrics = checkpoint["val_metrics"]
+    summary = {
+        "run_id": run.run_id,
+        "best_epoch": best_epoch,
+        "selection_metric": args.selection_metric,
+        "best_selection_score": best_score,
+        "best_val_positive_dice": best_metrics["positive_dice"],
+        "best_val_empty_specificity": best_metrics["empty_specificity"],
+        "best_val_balanced_dice": best_metrics["balanced_dice"],
+        "epochs_completed": len(history),
+        "early_stopping_patience": args.early_stopping,
+        "checkpoint": str(run.checkpoint_path),
+        "config": config,
+    }
     model.load_state_dict(checkpoint["model_state_dict"])
     predictions = collect_segmentation_predictions(
         model,
@@ -365,7 +511,10 @@ def main() -> None:
     summary["prediction_split"] = "validation"
     summary["prediction_count"] = len(predictions)
     save_run_outputs(history, summary, run.output_dir, predictions)
-    print(f"Best validation positive Dice={best_dice:.4f} at epoch {best_epoch}")
+    print(
+        f"Best validation {args.selection_metric}={best_score:.4f} "
+        f"at epoch {best_epoch}"
+    )
     print(f"Saved best checkpoint to {run.checkpoint_path}")
 
 

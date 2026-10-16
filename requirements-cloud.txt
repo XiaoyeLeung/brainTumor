@@ -6,5 +6,6 @@ opencv-python-headless==4.14.0.94
 pandas==3.0.6
 Pillow==12.3.0
 scikit-learn==1.9.1
+scipy>=1.13
 matplotlib==3.11.2
 pytest>=8.0

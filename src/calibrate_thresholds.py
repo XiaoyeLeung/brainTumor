@@ -25,6 +25,14 @@ def main() -> None:
         load_predictions(args.segmentation_run, required_split="validation"),
         id_column=args.id_column,
     )
+    with args.segmentation_run.open() as file:
+        segmentation_report = json.load(file)
+    result["segmentation_postprocessing"] = segmentation_report.get(
+        "summary", {}
+    ).get(
+        "postprocessing",
+        {"min_component_pixels": 0, "no_tumor_gate_threshold": None},
+    )
     args.output_file.parent.mkdir(parents=True, exist_ok=True)
     with args.output_file.open("w") as file:
         json.dump(result, file, indent=2)

@@ -66,6 +66,8 @@ echo "Started: $(date --iso-8601=seconds)"
     --split test \
     --split-root "${SPLIT_ROOT}" \
     --output-dir "${PREDICTION_ROOT}/segmentation_test" \
+    --classification-run "${PREDICTION_ROOT}/classification_test/run.json" \
+    --postprocessing-config "${THRESHOLD_FILE}" \
     --num-workers "${NUM_WORKERS}" \
     --device cuda
 

@@ -38,8 +38,9 @@ def classification_metrics(frame: pd.DataFrame) -> dict[str, float]:
     }
 
 
-def segmentation_metrics(frame: pd.DataFrame) -> dict[str, float]:
+def segmentation_metrics(frame: pd.DataFrame) -> dict[str, float | None]:
     positive = frame.loc[frame["tumor_label"] != "no_tumor"]
+    negative = frame.loc[frame["tumor_label"] == "no_tumor"]
     if positive.empty:
         raise ValueError("Segmentation evaluation requires tumor-positive samples")
     return {
@@ -47,6 +48,16 @@ def segmentation_metrics(frame: pd.DataFrame) -> dict[str, float]:
         "mean_iou_all": float(frame["mask_iou"].mean()),
         "mean_dice_positive": float(positive["mask_dice"].mean()),
         "mean_iou_positive": float(positive["mask_iou"].mean()),
+        "empty_mask_specificity": float(
+            (negative["predicted_mask_area_fraction"] == 0.0).mean()
+        )
+        if not negative.empty
+        else None,
+        "mean_predicted_area_no_tumor": float(
+            negative["predicted_mask_area_fraction"].mean()
+        )
+        if not negative.empty
+        else None,
     }
 
 

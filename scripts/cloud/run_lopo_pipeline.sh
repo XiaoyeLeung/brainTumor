@@ -51,6 +51,8 @@ for HELD_OUT_PLANE in "${PLANES[@]}"; do
         --split test \
         --split-root "${SPLIT_ROOT}" \
         --output-dir "${PREDICTION_ROOT}/segmentation_heldout" \
+        --classification-run "${PREDICTION_ROOT}/classification_heldout/run.json" \
+        --postprocessing-config "${REPORT_ROOT}/thresholds.json" \
         --num-workers "${NUM_WORKERS}" \
         --device cuda
 
