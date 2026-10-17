@@ -12,7 +12,10 @@ fi
 PYTHON_BIN="${BRAINTUMOR_PYTHON:-python}"
 SEED="${BRAINTUMOR_SEED:-42}"
 HELD_OUT_PLANE="${BRAINTUMOR_HELD_OUT_PLANE:-none}"
-PATIENCE="${BRAINTUMOR_EARLY_STOPPING_PATIENCE:-5}"
+DEFAULT_PATIENCE="${BRAINTUMOR_EARLY_STOPPING_PATIENCE:-5}"
+CLASSIFICATION_PATIENCE="${BRAINTUMOR_CLASSIFICATION_EARLY_STOPPING_PATIENCE:-${DEFAULT_PATIENCE}}"
+PRETRAINING_PATIENCE="${BRAINTUMOR_PRETRAINING_EARLY_STOPPING_PATIENCE:-${DEFAULT_PATIENCE}}"
+SEGMENTATION_PATIENCE="${BRAINTUMOR_SEGMENTATION_EARLY_STOPPING_PATIENCE:-${DEFAULT_PATIENCE}}"
 HEAD_EPOCHS="${BRAINTUMOR_CLASSIFICATION_HEAD_EPOCHS:-2}"
 FINE_TUNE_EPOCHS="${BRAINTUMOR_CLASSIFICATION_FINE_TUNE_EPOCHS:-30}"
 SEGMENTATION_EPOCHS="${BRAINTUMOR_SEGMENTATION_EPOCHS:-30}"
@@ -23,6 +26,7 @@ PRETRAINING_PATCH_SIZE="${BRAINTUMOR_PRETRAINING_PATCH_SIZE:-16}"
 PRETRAINING_MASK_RATIO="${BRAINTUMOR_PRETRAINING_MASK_RATIO:-0.35}"
 PRETRAINING_NOISE_STD="${BRAINTUMOR_PRETRAINING_NOISE_STD:-0.05}"
 PRETRAINING_LR="${BRAINTUMOR_PRETRAINING_LR:-0.001}"
+PRETRAINING_TRANSFER_SCOPE="${BRAINTUMOR_PRETRAINING_TRANSFER_SCOPE:-encoder_decoder}"
 SEGMENTATION_FP_WEIGHT="${BRAINTUMOR_SEGMENTATION_FP_WEIGHT:-0.7}"
 EMPTY_MASK_WEIGHT="${BRAINTUMOR_EMPTY_MASK_WEIGHT:-2.0}"
 SEGMENTATION_SELECTION_METRIC="${BRAINTUMOR_SEGMENTATION_SELECTION_METRIC:-balanced_dice}"
@@ -32,6 +36,14 @@ NO_TUMOR_GATE_THRESHOLD="${BRAINTUMOR_NO_TUMOR_GATE_THRESHOLD:-0.9}"
 NUM_WORKERS="${BRAINTUMOR_NUM_WORKERS:-4}"
 EXPERIMENT_TAG="${BRAINTUMOR_EXPERIMENT_TAG:-}"
 export PYTHONUNBUFFERED=1
+
+case "${PRETRAINING_TRANSFER_SCOPE}" in
+    encoder | encoder_decoder) ;;
+    *)
+        echo "BRAINTUMOR_PRETRAINING_TRANSFER_SCOPE must be encoder or encoder_decoder" >&2
+        exit 2
+        ;;
+esac
 
 if [[ "${HELD_OUT_PLANE}" == "none" ]]; then
     SPLIT_NAME="all_planes_seed${SEED}"
@@ -53,7 +65,10 @@ exec > >(tee -a "${LOG_ROOT}/development_pipeline.log") 2>&1
 
 echo "Experiment: ${EXPERIMENT_NAME}"
 echo "Masked U-Net pretraining: ${MASKED_PRETRAINING}"
+echo "Pretraining epochs: ${PRETRAINING_EPOCHS}"
+echo "Pretraining transfer scope: ${PRETRAINING_TRANSFER_SCOPE}"
 echo "Segmentation selection metric: ${SEGMENTATION_SELECTION_METRIC}"
+echo "Segmentation epochs: ${SEGMENTATION_EPOCHS}"
 echo "Segmentation postprocessing: ${SEGMENTATION_POSTPROCESSING}"
 echo "Development pipeline started: $(date --iso-8601=seconds)"
 nvidia-smi
@@ -83,7 +98,7 @@ else
         --batch-size 32 \
         --head-epochs "${HEAD_EPOCHS}" \
         --fine-tune-epochs "${FINE_TUNE_EPOCHS}" \
-        --earlyStopping "${PATIENCE}" \
+        --earlyStopping "${CLASSIFICATION_PATIENCE}" \
         --num-workers "${NUM_WORKERS}" \
         --device cuda \
         --seed "${SEED}"
@@ -105,13 +120,13 @@ case "${MASKED_PRETRAINING}" in
             --patch-size "${PRETRAINING_PATCH_SIZE}" \
             --mask-ratio "${PRETRAINING_MASK_RATIO}" \
             --noise-std "${PRETRAINING_NOISE_STD}" \
-            --earlyStopping "${PATIENCE}" \
+            --earlyStopping "${PRETRAINING_PATIENCE}" \
             --num-workers "${NUM_WORKERS}" \
             --device cuda \
             --seed "${SEED}"
         SEGMENTATION_INITIALIZATION_ARGS=(
             --initial-checkpoint "${CHECKPOINT_ROOT}/segmentation_pretraining/best.pt"
-            --initialization-scope encoder_decoder
+            --initialization-scope "${PRETRAINING_TRANSFER_SCOPE}"
         )
         ;;
     *)
@@ -131,7 +146,7 @@ esac
     --false-positive-weight "${SEGMENTATION_FP_WEIGHT}" \
     --empty-mask-weight "${EMPTY_MASK_WEIGHT}" \
     --selection-metric "${SEGMENTATION_SELECTION_METRIC}" \
-    --earlyStopping "${PATIENCE}" \
+    --earlyStopping "${SEGMENTATION_PATIENCE}" \
     --num-workers "${NUM_WORKERS}" \
     --device cuda \
     --seed "${SEED}" \

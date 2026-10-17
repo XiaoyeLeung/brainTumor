@@ -67,6 +67,24 @@ full split -> classification training -> segmentation training
 -> validation inference -> validation threshold calibration
 ```
 
+Segmentation training uses a false-positive-aware Tversky loss, gives extra BCE
+weight to no-tumor images, and selects checkpoints using the mean of tumor Dice
+and empty-mask specificity. Inference removes connected components smaller than
+64 pixels and clears masks when the classifier assigns at least 0.90 probability
+to `no_tumor`. The validation run records these post-processing settings in
+`thresholds.json`; final-test and LOPO inference load that configuration rather
+than duplicating it.
+
+The defaults can be overridden before a development run:
+
+```bash
+BRAINTUMOR_SEGMENTATION_FP_WEIGHT=0.7 \
+BRAINTUMOR_EMPTY_MASK_WEIGHT=2.0 \
+BRAINTUMOR_MIN_COMPONENT_PIXELS=64 \
+BRAINTUMOR_NO_TUMOR_GATE_THRESHOLD=0.9 \
+bash scripts/cloud/run_development_pipeline.sh
+```
+
 It records the Python environment, GPU information, Git commit, checkpoints,
 validation predictions, thresholds, and a combined pipeline log. It does not run
 inference on official-test images.
