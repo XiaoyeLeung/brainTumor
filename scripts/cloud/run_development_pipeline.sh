@@ -16,20 +16,31 @@ PATIENCE="${BRAINTUMOR_EARLY_STOPPING_PATIENCE:-5}"
 HEAD_EPOCHS="${BRAINTUMOR_CLASSIFICATION_HEAD_EPOCHS:-2}"
 FINE_TUNE_EPOCHS="${BRAINTUMOR_CLASSIFICATION_FINE_TUNE_EPOCHS:-30}"
 SEGMENTATION_EPOCHS="${BRAINTUMOR_SEGMENTATION_EPOCHS:-30}"
+MASKED_PRETRAINING="${BRAINTUMOR_MASKED_PRETRAINING:-0}"
+PRETRAINING_EPOCHS="${BRAINTUMOR_PRETRAINING_EPOCHS:-30}"
+PRETRAINING_BATCH_SIZE="${BRAINTUMOR_PRETRAINING_BATCH_SIZE:-8}"
+PRETRAINING_PATCH_SIZE="${BRAINTUMOR_PRETRAINING_PATCH_SIZE:-16}"
+PRETRAINING_MASK_RATIO="${BRAINTUMOR_PRETRAINING_MASK_RATIO:-0.35}"
+PRETRAINING_NOISE_STD="${BRAINTUMOR_PRETRAINING_NOISE_STD:-0.05}"
+PRETRAINING_LR="${BRAINTUMOR_PRETRAINING_LR:-0.001}"
 SEGMENTATION_FP_WEIGHT="${BRAINTUMOR_SEGMENTATION_FP_WEIGHT:-0.7}"
 EMPTY_MASK_WEIGHT="${BRAINTUMOR_EMPTY_MASK_WEIGHT:-2.0}"
+SEGMENTATION_SELECTION_METRIC="${BRAINTUMOR_SEGMENTATION_SELECTION_METRIC:-balanced_dice}"
+SEGMENTATION_POSTPROCESSING="${BRAINTUMOR_SEGMENTATION_POSTPROCESSING:-1}"
 MIN_COMPONENT_PIXELS="${BRAINTUMOR_MIN_COMPONENT_PIXELS:-64}"
 NO_TUMOR_GATE_THRESHOLD="${BRAINTUMOR_NO_TUMOR_GATE_THRESHOLD:-0.9}"
 NUM_WORKERS="${BRAINTUMOR_NUM_WORKERS:-4}"
+EXPERIMENT_TAG="${BRAINTUMOR_EXPERIMENT_TAG:-}"
 export PYTHONUNBUFFERED=1
 
 if [[ "${HELD_OUT_PLANE}" == "none" ]]; then
-    EXPERIMENT_NAME="all_planes_seed${SEED}"
+    SPLIT_NAME="all_planes_seed${SEED}"
 else
-    EXPERIMENT_NAME="leave_${HELD_OUT_PLANE}_out_seed${SEED}"
+    SPLIT_NAME="leave_${HELD_OUT_PLANE}_out_seed${SEED}"
 fi
 
-SPLIT_ROOT="${PROJECT_ROOT}/data/experiments/${EXPERIMENT_NAME}"
+EXPERIMENT_NAME="${SPLIT_NAME}${EXPERIMENT_TAG:+_${EXPERIMENT_TAG}}"
+SPLIT_ROOT="${PROJECT_ROOT}/data/experiments/${SPLIT_NAME}"
 RESULT_ROOT="${PROJECT_ROOT}/results/${EXPERIMENT_NAME}"
 CHECKPOINT_ROOT="${PROJECT_ROOT}/checkpoints/${EXPERIMENT_NAME}"
 TRAIN_ROOT="${RESULT_ROOT}/training"
@@ -41,6 +52,9 @@ mkdir -p "${TRAIN_ROOT}" "${PREDICTION_ROOT}" "${REPORT_ROOT}" "${LOG_ROOT}"
 exec > >(tee -a "${LOG_ROOT}/development_pipeline.log") 2>&1
 
 echo "Experiment: ${EXPERIMENT_NAME}"
+echo "Masked U-Net pretraining: ${MASKED_PRETRAINING}"
+echo "Segmentation selection metric: ${SEGMENTATION_SELECTION_METRIC}"
+echo "Segmentation postprocessing: ${SEGMENTATION_POSTPROCESSING}"
 echo "Development pipeline started: $(date --iso-8601=seconds)"
 nvidia-smi
 "${PYTHON_BIN}" -c 'import torch; assert torch.cuda.is_available(), "CUDA is unavailable"; print(torch.cuda.get_device_name(0))'
@@ -52,7 +66,7 @@ nvidia-smi
     --output-root "${PROJECT_ROOT}/data/experiments"
 cp "${SPLIT_ROOT}/split_manifest.csv" "${REPORT_ROOT}/split_manifest.csv"
 
-CLASSIFICATION_CHECKPOINT="${CHECKPOINT_ROOT}/classification/best.pt"
+CLASSIFICATION_CHECKPOINT="${BRAINTUMOR_CLASSIFICATION_CHECKPOINT:-${CHECKPOINT_ROOT}/classification/best.pt}"
 if [[ "${BRAINTUMOR_REUSE_CLASSIFICATION_CHECKPOINT:-0}" == "1" ]]; then
     if [[ ! -f "${CLASSIFICATION_CHECKPOINT}" ]]; then
         echo "Requested classification checkpoint reuse, but it is missing: ${CLASSIFICATION_CHECKPOINT}" >&2
@@ -75,6 +89,37 @@ else
         --seed "${SEED}"
 fi
 
+SEGMENTATION_INITIALIZATION_ARGS=()
+case "${MASKED_PRETRAINING}" in
+    0) ;;
+    1)
+        "${PYTHON_BIN}" src/pretrain_segmentation.py \
+            --split-root "${SPLIT_ROOT}" \
+            --output-dir "${TRAIN_ROOT}" \
+            --checkpoint-dir "${CHECKPOINT_ROOT}" \
+            --run-name segmentation_pretraining \
+            --image-size 256 \
+            --batch-size "${PRETRAINING_BATCH_SIZE}" \
+            --epochs "${PRETRAINING_EPOCHS}" \
+            --lr "${PRETRAINING_LR}" \
+            --patch-size "${PRETRAINING_PATCH_SIZE}" \
+            --mask-ratio "${PRETRAINING_MASK_RATIO}" \
+            --noise-std "${PRETRAINING_NOISE_STD}" \
+            --earlyStopping "${PATIENCE}" \
+            --num-workers "${NUM_WORKERS}" \
+            --device cuda \
+            --seed "${SEED}"
+        SEGMENTATION_INITIALIZATION_ARGS=(
+            --initial-checkpoint "${CHECKPOINT_ROOT}/segmentation_pretraining/best.pt"
+            --initialization-scope encoder_decoder
+        )
+        ;;
+    *)
+        echo "BRAINTUMOR_MASKED_PRETRAINING must be 0 or 1" >&2
+        exit 2
+        ;;
+esac
+
 "${PYTHON_BIN}" src/train_segmentation.py \
     --split-root "${SPLIT_ROOT}" \
     --output-dir "${TRAIN_ROOT}" \
@@ -85,11 +130,12 @@ fi
     --epochs "${SEGMENTATION_EPOCHS}" \
     --false-positive-weight "${SEGMENTATION_FP_WEIGHT}" \
     --empty-mask-weight "${EMPTY_MASK_WEIGHT}" \
-    --selection-metric balanced_dice \
+    --selection-metric "${SEGMENTATION_SELECTION_METRIC}" \
     --earlyStopping "${PATIENCE}" \
     --num-workers "${NUM_WORKERS}" \
     --device cuda \
-    --seed "${SEED}"
+    --seed "${SEED}" \
+    "${SEGMENTATION_INITIALIZATION_ARGS[@]}"
 
 "${PYTHON_BIN}" src/predict.py \
     --task classification \
@@ -100,17 +146,31 @@ fi
     --num-workers "${NUM_WORKERS}" \
     --device cuda
 
+SEGMENTATION_PREDICTION_ARGS=()
+case "${SEGMENTATION_POSTPROCESSING}" in
+    0) ;;
+    1)
+        SEGMENTATION_PREDICTION_ARGS=(
+            --classification-run "${PREDICTION_ROOT}/classification_validation/run.json"
+            --min-component-pixels "${MIN_COMPONENT_PIXELS}"
+            --no-tumor-gate-threshold "${NO_TUMOR_GATE_THRESHOLD}"
+        )
+        ;;
+    *)
+        echo "BRAINTUMOR_SEGMENTATION_POSTPROCESSING must be 0 or 1" >&2
+        exit 2
+        ;;
+esac
+
 "${PYTHON_BIN}" src/predict.py \
     --task segmentation \
     --checkpoint "${CHECKPOINT_ROOT}/segmentation/best.pt" \
     --split validation \
     --split-root "${SPLIT_ROOT}" \
     --output-dir "${PREDICTION_ROOT}/segmentation_validation" \
-    --classification-run "${PREDICTION_ROOT}/classification_validation/run.json" \
-    --min-component-pixels "${MIN_COMPONENT_PIXELS}" \
-    --no-tumor-gate-threshold "${NO_TUMOR_GATE_THRESHOLD}" \
     --num-workers "${NUM_WORKERS}" \
-    --device cuda
+    --device cuda \
+    "${SEGMENTATION_PREDICTION_ARGS[@]}"
 
 "${PYTHON_BIN}" src/calibrate_thresholds.py \
     --classification-run "${PREDICTION_ROOT}/classification_validation/run.json" \

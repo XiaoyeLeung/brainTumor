@@ -29,6 +29,68 @@ from segmentation_postprocessing import (
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+ENCODER_PREFIXES = ("inc.", "down1.", "down2.", "down3.", "down4.")
+DECODER_PREFIXES = ("up1.", "up2.", "up3.", "up4.")
+
+
+def load_pretrained_unet(
+    model: UNet,
+    checkpoint_path: Path,
+    device: torch.device,
+    scope: str = "encoder_decoder",
+) -> dict[str, object]:
+    """Load train-only reconstruction weights without loading the output head."""
+    if scope not in {"encoder", "encoder_decoder"}:
+        raise ValueError("scope must be 'encoder' or 'encoder_decoder'")
+
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    if checkpoint.get("pretraining_source_split") != "train":
+        raise ValueError(
+            "Pretraining checkpoint is missing train-only provenance metadata"
+        )
+
+    pretraining_config = checkpoint.get("config", {})
+    if bool(pretraining_config.get("bilinear", False)) != model.bilinear:
+        raise ValueError(
+            "Pretraining and segmentation models must use the same upsampling mode"
+        )
+
+    prefixes = ENCODER_PREFIXES
+    if scope == "encoder_decoder":
+        prefixes += DECODER_PREFIXES
+    source_state = checkpoint.get("model_state_dict")
+    if not isinstance(source_state, dict):
+        raise ValueError("Pretraining checkpoint has no model_state_dict")
+
+    model_state = model.state_dict()
+    transferred = {
+        name: value
+        for name, value in source_state.items()
+        if name.startswith(prefixes)
+        and name in model_state
+        and model_state[name].shape == value.shape
+    }
+    expected = {name for name in model_state if name.startswith(prefixes)}
+    if set(transferred) != expected:
+        missing = sorted(expected - set(transferred))
+        raise ValueError(
+            "Pretraining checkpoint is incompatible; missing transferable weights: "
+            + ", ".join(missing)
+        )
+
+    incompatible = model.load_state_dict(transferred, strict=False)
+    if incompatible.unexpected_keys:
+        raise ValueError(
+            "Unexpected pretraining weights: " + ", ".join(incompatible.unexpected_keys)
+        )
+    return {
+        "checkpoint": str(checkpoint_path),
+        "scope": scope,
+        "transferred_tensor_count": len(transferred),
+        "pretraining_epoch": checkpoint.get("epoch"),
+        "pretraining_val_masked_l1": checkpoint.get("val_masked_l1"),
+        "output_head_reinitialized": True,
+    }
 
 
 def soft_dice_loss(
@@ -160,6 +222,17 @@ def parse_args() -> argparse.Namespace:
         "--bilinear",
         action="store_true",
         help="Use bilinear upsampling instead of transposed convolutions.",
+    )
+    parser.add_argument(
+        "--initial-checkpoint",
+        type=Path,
+        help="Train-only masked-pretraining checkpoint used to initialize U-Net.",
+    )
+    parser.add_argument(
+        "--initialization-scope",
+        choices=("encoder", "encoder_decoder"),
+        default="encoder_decoder",
+        help="Pretrained U-Net blocks to transfer; the output head is always new.",
     )
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument(
@@ -397,6 +470,20 @@ def main() -> None:
     )
 
     model = UNet(n_channels=1, n_classes=1, bilinear=args.bilinear).to(device)
+    initialization: dict[str, object] = {
+        "method": "random",
+        "output_head_reinitialized": True,
+    }
+    if args.initial_checkpoint is not None:
+        initialization = {
+            "method": "masked_denoising_autoencoder",
+            **load_pretrained_unet(
+                model,
+                args.initial_checkpoint,
+                device,
+                args.initialization_scope,
+            ),
+        }
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     history: list[dict[str, float | int]] = []
     best_score = -1.0
@@ -413,6 +500,12 @@ def main() -> None:
     print(
         f"Device: {device}; train={len(train_dataset)}, validation={len(validation_dataset)}"
     )
+    if args.initial_checkpoint is not None:
+        print(
+            "Initialized U-Net from masked pretraining: "
+            f"{initialization['transferred_tensor_count']} tensors "
+            f"({args.initialization_scope}); output head is new."
+        )
     for epoch in range(1, args.epochs + 1):
         train_metrics = run_segmentation_epoch(
             model,
@@ -464,6 +557,7 @@ def main() -> None:
                     "val_metrics": validation_metrics,
                     "selection_metric": args.selection_metric,
                     "selection_score": selection_score,
+                    "initialization": initialization,
                     "config": config,
                 },
                 run.checkpoint_path,
@@ -498,6 +592,7 @@ def main() -> None:
         "epochs_completed": len(history),
         "early_stopping_patience": args.early_stopping,
         "checkpoint": str(run.checkpoint_path),
+        "initialization": initialization,
         "config": config,
     }
     model.load_state_dict(checkpoint["model_state_dict"])

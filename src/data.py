@@ -77,6 +77,29 @@ class SegmentationDataset(Dataset):
         return transformed["image"], transformed["mask"].float().unsqueeze(0)
 
 
+class ReconstructionDataset(Dataset):
+    """Unlabeled grayscale images used by the masked reconstruction task."""
+
+    def __init__(
+        self,
+        frame: pd.DataFrame,
+        data_root: Path,
+        transform: transforms.Compose,
+    ) -> None:
+        self.frame = frame.reset_index(drop=True)
+        self.data_root = data_root
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return len(self.frame)
+
+    def __getitem__(self, index: int) -> torch.Tensor:
+        row = self.frame.iloc[index]
+        relative_path = Path(str(row["relative_path"]).replace("\\", "/"))
+        with Image.open(self.data_root / relative_path) as image:
+            return self.transform(image.convert("L"))
+
+
 def build_classification_transforms(
     image_size: int,
 ) -> tuple[transforms.Compose, transforms.Compose]:
@@ -95,6 +118,34 @@ def build_classification_transforms(
     )
     validation_transform = transforms.Compose(
         [transforms.Resize((image_size, image_size)), transforms.ToTensor(), normalize]
+    )
+    return train_transform, validation_transform
+
+
+def build_reconstruction_transforms(
+    image_size: int,
+) -> tuple[transforms.Compose, transforms.Compose]:
+    """Return mild train augmentation and deterministic reconstruction transforms."""
+    normalize = transforms.Normalize(mean=(0.5,), std=(0.5,))
+    train_transform = transforms.Compose(
+        [
+            transforms.Resize((image_size, image_size)),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomAffine(
+                degrees=10,
+                translate=(0.05, 0.05),
+                scale=(0.95, 1.05),
+            ),
+            transforms.ToTensor(),
+            normalize,
+        ]
+    )
+    validation_transform = transforms.Compose(
+        [
+            transforms.Resize((image_size, image_size)),
+            transforms.ToTensor(),
+            normalize,
+        ]
     )
     return train_transform, validation_transform
 
