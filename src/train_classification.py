@@ -16,7 +16,7 @@ from data import (
     ClassificationDataset,
     build_train_validation_loaders,
     build_classification_transforms,
-    load_classification_frames,
+    load_classification_frame,
 )
 from models import (
     build_resnet18_classifier,
@@ -111,8 +111,9 @@ def run_classification_epoch(
 
     with torch.set_grad_enabled(training):
         for images, labels in loader:
-            images = images.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
+            non_blocking = device.type == "cuda"
+            images = images.to(device, non_blocking=non_blocking)
+            labels = labels.to(device, non_blocking=non_blocking)
 
             if training:
                 optimizer.zero_grad(set_to_none=True)
@@ -171,7 +172,8 @@ def main() -> None:
 
     seed_everything(args.seed)
     device = select_device(args.device)
-    train_frame, validation_frame = load_classification_frames(args.split_root)
+    train_frame = load_classification_frame(args.split_root, "train")
+    validation_frame = load_classification_frame(args.split_root, "validation")
 
     train_transform, validation_transform = build_classification_transforms(
         args.image_size

@@ -45,7 +45,6 @@ def select_balanced_accuracy_threshold(
     targets: pd.Series,
     scores: pd.Series,
 ) -> tuple[float, float]:
-    """Return the threshold and balanced accuracy, favoring sensitivity on ties."""
     _validate_unit_interval(scores, "scores")
     labels = targets.astype(bool).to_numpy()
     if len(labels) == 0 or len(np.unique(labels)) != 2:
@@ -69,7 +68,7 @@ def calibrate_thresholds(
     *,
     id_column: str = "filename",
 ) -> dict[str, object]:
-    """Select tumor-presence thresholds from aligned validation predictions."""
+    """select tumor-presence thresholds from aligned validation predictions."""
     _require_columns(
         classification,
         {id_column, "tumor_label", "no_tumor_probability"},
@@ -86,12 +85,8 @@ def calibrate_thresholds(
     ):
         raise ValueError(f"{id_column!r} values must be unique in both files")
 
-    aligned = classification[
-        [id_column, "tumor_label", "no_tumor_probability"]
-    ].merge(
-        segmentation[
-            [id_column, "tumor_label", "predicted_mask_area_fraction"]
-        ],
+    aligned = classification[[id_column, "tumor_label", "no_tumor_probability"]].merge(
+        segmentation[[id_column, "tumor_label", "predicted_mask_area_fraction"]],
         on=id_column,
         how="outer",
         validate="one_to_one",
@@ -105,16 +100,15 @@ def calibrate_thresholds(
             f"validation samples. Examples: {examples.tolist()}"
         )
     if not (
-        aligned["tumor_label_classification"]
-        == aligned["tumor_label_segmentation"]
+        aligned["tumor_label_classification"] == aligned["tumor_label_segmentation"]
     ).all():
         raise ValueError("Classification and segmentation tumor labels differ")
 
     targets = aligned["tumor_label_classification"] != "no_tumor"
     classification_scores = 1.0 - aligned["no_tumor_probability"]
     area_scores = aligned["predicted_mask_area_fraction"]
-    classification_threshold, classification_score = (
-        select_balanced_accuracy_threshold(targets, classification_scores)
+    classification_threshold, classification_score = select_balanced_accuracy_threshold(
+        targets, classification_scores
     )
     area_threshold, segmentation_score = select_balanced_accuracy_threshold(
         targets, area_scores
@@ -180,9 +174,7 @@ def fuse_predictions(
         result["predicted_mask_area_fraction"],
         "predicted_mask_area_fraction",
     )
-    result["classification_tumor_probability"] = 1.0 - result[
-        "no_tumor_probability"
-    ]
+    result["classification_tumor_probability"] = 1.0 - result["no_tumor_probability"]
     result["classification_says_tumor"] = (
         result["classification_tumor_probability"] >= classification_threshold
     )
@@ -263,7 +255,7 @@ def save_report(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Fuse two models' decisions into one JSON audit report."
+        description="Fuse two models' decisions into one audit report."
     )
     parser.add_argument("--classification-run", type=Path, required=True)
     parser.add_argument("--segmentation-run", type=Path, required=True)

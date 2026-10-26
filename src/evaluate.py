@@ -25,7 +25,9 @@ def parse_args() -> argparse.Namespace:
 
 def classification_metrics(frame: pd.DataFrame) -> dict[str, float]:
     return {
-        "accuracy": float(accuracy_score(frame["tumor_label"], frame["predicted_class"])),
+        "accuracy": float(
+            accuracy_score(frame["tumor_label"], frame["predicted_class"])
+        ),
         "macro_f1": float(
             f1_score(
                 frame["tumor_label"],
@@ -48,16 +50,16 @@ def segmentation_metrics(frame: pd.DataFrame) -> dict[str, float | None]:
         "mean_iou_all": float(frame["mask_iou"].mean()),
         "mean_dice_positive": float(positive["mask_dice"].mean()),
         "mean_iou_positive": float(positive["mask_iou"].mean()),
-        "empty_mask_specificity": float(
-            (negative["predicted_mask_area_fraction"] == 0.0).mean()
-        )
-        if not negative.empty
-        else None,
-        "mean_predicted_area_no_tumor": float(
-            negative["predicted_mask_area_fraction"].mean()
-        )
-        if not negative.empty
-        else None,
+        "empty_mask_specificity": (
+            float((negative["predicted_mask_area_fraction"] == 0.0).mean())
+            if not negative.empty
+            else None
+        ),
+        "mean_predicted_area_no_tumor": (
+            float(negative["predicted_mask_area_fraction"].mean())
+            if not negative.empty
+            else None
+        ),
     }
 
 
@@ -79,9 +81,7 @@ def evaluate(
     if set(fusion_samples[id_column]) != set(classification[id_column]):
         raise ValueError("Fusion and prediction IDs differ")
 
-    covered_ids = set(
-        fusion_samples.loc[~fusion_samples["is_uncertain"], id_column]
-    )
+    covered_ids = set(fusion_samples.loc[~fusion_samples["is_uncertain"], id_column])
     covered_classification = classification.loc[
         classification[id_column].isin(covered_ids)
     ]

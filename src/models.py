@@ -24,6 +24,7 @@ def set_resnet_backbone_trainable(model: nn.Module, trainable: bool) -> None:
         parameter.requires_grad = True
 
 
+# component of Unet
 class DoubleConv(nn.Module):
     """Two convolution, batch-normalization, and ReLU blocks."""
 
@@ -44,6 +45,7 @@ class DoubleConv(nn.Module):
         return self.double_conv(x)
 
 
+# component of Unet
 class Down(nn.Module):
     """Downscale with max pooling, then apply a double convolution."""
 
@@ -57,6 +59,7 @@ class Down(nn.Module):
         return self.maxpool_conv(x)
 
 
+# component of Unet
 class Up(nn.Module):
     """Upscale and combine a decoder tensor with its skip connection."""
 
@@ -138,8 +141,6 @@ class UNet(nn.Module):
 
 
 class ResNet18Encoder(nn.Module):
-    """ResNet18 feature extractor exposing maps for decoder skip connections."""
-
     output_channels = (64, 64, 128, 256, 512)
 
     def __init__(self, pretrained: bool = True) -> None:
@@ -164,7 +165,7 @@ class ResNet18Encoder(nn.Module):
 
 
 class DecoderBlock(nn.Module):
-    """Upsample a feature map and fuse it with an encoder skip connection."""
+    """upsample a feature map and fuse it with an encoder skip connection."""
 
     def __init__(
         self,
@@ -185,8 +186,8 @@ class DecoderBlock(nn.Module):
         return self.conv(torch.cat((x, skip), dim=1))
 
 
+# optional; didnt use in our study
 class MultiTaskResNetUNet(nn.Module):
-    """Optional shared ResNet18 encoder with two task-specific heads."""
 
     def __init__(
         self,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 
 import numpy as np
@@ -26,17 +27,17 @@ from runtime import (
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PLANES = ("axial", "coronal", "sagittal")
 
 
+# split downstream-training rows for reconstruction
 def split_pretraining_frame(
     frame: pd.DataFrame,
     *,
     validation_fraction: float,
     seed: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Split downstream-training rows for reconstruction without evaluation leakage."""
-    if not 0.0 < validation_fraction < 1.0:
-        raise ValueError("validation_fraction must be between 0 and 1")
+
     if len(frame) < 2:
         raise ValueError("Masked pretraining requires at least two training images")
     if frame["filename"].duplicated().any():
@@ -60,6 +61,34 @@ def split_pretraining_frame(
     )
 
 
+def validate_excluded_plane(frame: pd.DataFrame, excluded_plane: str | None) -> None:
+    """strict LOPO training"""
+    if excluded_plane is None:
+        return
+    if "plane_label" not in frame:
+        raise ValueError(
+            "Strict LOPO pretraining requires a plane_label column in the split"
+        )
+    source_planes = set(frame["plane_label"].astype(str))
+    if excluded_plane in source_planes:
+        raise ValueError(
+            f"Held-out plane {excluded_plane!r} is present in pretraining rows"
+        )
+    expected_source_planes = set(PLANES) - {excluded_plane}
+    if source_planes != expected_source_planes:
+        raise ValueError(
+            "Strict LOPO pretraining requires both non-held-out planes: "
+            f"{sorted(source_planes)} != {sorted(expected_source_planes)}"
+        )
+    if "held_out_plane" in frame:
+        declared_planes = set(frame["held_out_plane"].astype(str))
+        if declared_planes != {excluded_plane}:
+            raise ValueError(
+                "Split held_out_plane metadata does not match --excluded-plane: "
+                f"{sorted(declared_planes)} != {excluded_plane!r}"
+            )
+
+
 def build_patch_mask(
     batch_size: int,
     height: int,
@@ -69,9 +98,7 @@ def build_patch_mask(
     mask_ratio: float,
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
-    """Create an exact-ratio random block mask with shape (B, 1, H, W)."""
-    if patch_size < 1:
-        raise ValueError("patch_size must be positive")
+    """create random mask with shape (B, 1, H, W)."""
     if height % patch_size or width % patch_size:
         raise ValueError("Image dimensions must be divisible by patch_size")
     if not 0.0 < mask_ratio < 1.0:
@@ -83,11 +110,15 @@ def build_patch_mask(
     if patch_count < 2:
         raise ValueError("At least two patches are required")
     masked_patch_count = max(1, min(patch_count - 1, round(patch_count * mask_ratio)))
-    selected = torch.rand(
-        batch_size,
-        patch_count,
-        generator=generator,
-    ).topk(masked_patch_count, dim=1).indices
+    selected = (
+        torch.rand(
+            batch_size,
+            patch_count,
+            generator=generator,
+        )
+        .topk(masked_patch_count, dim=1)
+        .indices
+    )
     patch_mask = torch.zeros(batch_size, patch_count, dtype=torch.bool)
     patch_mask.scatter_(1, selected, True)
     return (
@@ -105,7 +136,7 @@ def corrupt_images(
     noise_std: float,
     generator: torch.Generator | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Add light Gaussian noise and replace selected patches with normalized zero."""
+    """add light Gaussian noise and replace selected patches with normalized zero"""
     mask = build_patch_mask(
         len(images),
         images.shape[-2],
@@ -131,7 +162,7 @@ def masked_reconstruction_loss(
     target: torch.Tensor,
     mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Mean absolute reconstruction error over masked pixels only."""
+
     if reconstruction.shape != target.shape or mask.shape != target.shape:
         raise ValueError("reconstruction, target, and mask shapes must match")
     masked_pixels = mask.sum()
@@ -201,12 +232,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument(
+        "--resume-checkpoint",
+        type=Path,
+        help="Continue from saved model weights; optimizer state is restarted.",
+    )
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--patch-size", type=int, default=16)
     parser.add_argument("--mask-ratio", type=float, default=0.35)
     parser.add_argument("--noise-std", type=float, default=0.05)
     parser.add_argument("--validation-fraction", type=float, default=0.1)
+    parser.add_argument(
+        "--excluded-plane",
+        choices=PLANES,
+        help=("LOPO setting"),
+    )
     parser.add_argument(
         "--bilinear",
         action="store_true",
@@ -219,25 +260,9 @@ def parse_args() -> argparse.Namespace:
         const=5,
         type=int,
         metavar="PATIENCE",
-        help="Stop after PATIENCE non-improving validation epochs (default: 5).",
+        help="default: 5",
     )
     args = parser.parse_args()
-    if args.patch_size < 1:
-        parser.error("--patch-size must be positive")
-    if args.image_size <= args.patch_size or args.image_size % args.patch_size:
-        parser.error(
-            "--image-size must be divisible by and larger than --patch-size"
-        )
-    if not 0.0 < args.mask_ratio < 1.0:
-        parser.error("--mask-ratio must be between 0 and 1")
-    if args.noise_std < 0.0:
-        parser.error("--noise-std must be non-negative")
-    if not 0.0 < args.validation_fraction < 1.0:
-        parser.error("--validation-fraction must be between 0 and 1")
-    if args.epochs < 1:
-        parser.error("--epochs must be at least 1")
-    if args.early_stopping is not None and args.early_stopping < 1:
-        parser.error("--earlyStopping PATIENCE must be at least 1")
     return args
 
 
@@ -253,6 +278,7 @@ def main() -> None:
     device = select_device(args.device)
 
     source_frame = load_classification_frame(args.split_root, "train")
+    validate_excluded_plane(source_frame, args.excluded_plane)
     train_frame, validation_frame = split_pretraining_frame(
         source_frame,
         validation_fraction=args.validation_fraction,
@@ -299,13 +325,22 @@ def main() -> None:
     manifest = pd.concat(
         [
             train_frame[manifest_columns].assign(pretraining_split="train"),
-            validation_frame[manifest_columns].assign(
-                pretraining_split="validation"
-            ),
+            validation_frame[manifest_columns].assign(pretraining_split="validation"),
         ],
         ignore_index=True,
     )
-    manifest.to_csv(run.output_dir / "pretraining_manifest.csv", index=False)
+    manifest_path = run.output_dir / "pretraining_manifest.csv"
+    if args.resume_checkpoint is not None and manifest_path.exists():
+        prior_manifest = pd.read_csv(manifest_path)
+        if (
+            not prior_manifest.fillna("")
+            .astype(str)
+            .equals(manifest.fillna("").astype(str))
+        ):
+            raise ValueError(
+                "Current pretraining rows differ from the saved checkpoint run manifest"
+            )
+    manifest.to_csv(manifest_path, index=False)
 
     print(f"Run: {run.run_id}")
     print(
@@ -316,7 +351,48 @@ def main() -> None:
     best_loss = float("inf")
     best_epoch = 0
     epochs_without_improvement = 0
-    for epoch in range(1, args.epochs + 1):
+    completed_before_resume = 0
+    if args.resume_checkpoint is not None:
+        checkpoint = torch.load(
+            args.resume_checkpoint, map_location=device, weights_only=False
+        )
+        prior_config = checkpoint["config"]
+        for key in (
+            "run_name",
+            "image_size",
+            "batch_size",
+            "seed",
+            "epochs",
+            "lr",
+            "weight_decay",
+            "patch_size",
+            "mask_ratio",
+            "noise_std",
+            "validation_fraction",
+            "excluded_plane",
+            "bilinear",
+        ):
+            current = getattr(args, key)
+            if prior_config[key] != current:
+                raise ValueError(
+                    f"Resume checkpoint {key}={prior_config[key]!r} does not match "
+                    f"current value {current!r}"
+                )
+        model.load_state_dict(checkpoint["model_state_dict"])
+        completed_before_resume = int(checkpoint["epoch"])
+        if completed_before_resume >= args.epochs:
+            raise ValueError("Checkpoint has already reached the requested epoch count")
+        best_loss = float(checkpoint["val_masked_l1"])
+        best_epoch = completed_before_resume
+        print(
+            f"Resuming from best model at epoch {best_epoch}; "
+            "optimizer state is unavailable and will restart."
+        )
+    for epoch in range(completed_before_resume + 1, args.epochs + 1):
+        if args.resume_checkpoint is not None:
+            optimizer.param_groups[0]["lr"] = (
+                args.lr * (1 + math.cos(math.pi * (epoch - 1) / args.epochs)) / 2
+            )
         train_loss = run_reconstruction_epoch(
             model,
             train_loader,
@@ -359,12 +435,19 @@ def main() -> None:
                     "val_masked_l1": validation_loss,
                     "config": config,
                     "pretraining_source_split": "train",
+                    "pretraining_source_planes": (
+                        sorted(source_frame["plane_label"].astype(str).unique())
+                        if "plane_label" in source_frame
+                        else []
+                    ),
+                    "pretraining_excluded_plane": args.excluded_plane,
                 },
                 run.checkpoint_path,
             )
         else:
             epochs_without_improvement += 1
-        scheduler.step()
+        if args.resume_checkpoint is None:
+            scheduler.step()
 
         if (
             args.early_stopping is not None
@@ -380,12 +463,23 @@ def main() -> None:
         "run_id": run.run_id,
         "best_epoch": best_epoch,
         "best_val_masked_l1": best_loss,
-        "epochs_completed": len(history),
+        "epochs_completed": completed_before_resume + len(history),
+        "resume": (
+            {
+                "checkpoint": str(args.resume_checkpoint),
+                "checkpoint_epoch": completed_before_resume,
+                "optimizer_state_restored": False,
+                "history_before_resume_included": False,
+            }
+            if args.resume_checkpoint is not None
+            else None
+        ),
         "checkpoint": str(run.checkpoint_path),
         "config": config,
         "data_provenance": {
             "source_experiment_split": "train",
             "excluded_experiment_splits": ["validation", "test"],
+            "excluded_plane": args.excluded_plane,
             "source_count": len(source_frame),
             "pretraining_train_count": len(train_frame),
             "pretraining_validation_count": len(validation_frame),

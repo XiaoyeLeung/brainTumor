@@ -1,106 +1,8 @@
-Dear my friend Chrysi ;)
-Thanks !!!!
-To use github: 
-```
-git clone https://github.com/XiaoyeLeung/brainTumor.git
-cd brainTumor
+# Experiments
 
-conda create -n brainTumor python=3.12
-conda activate brainTumor
-pip install -r requirements.txt
-```
+## all-plane baseline
 
-The directory should have the structure:
-```
-brainTumor/
-├── brisc2025/
-├── data/
-├── notebooks/
-├── src/
-└── requirements.txt
-```
-
-
-Official test data must remain untouched.
-
-HAVE A NICE DAY!!!
-
-## Google Cloud full-dataset run
-
-The repository keeps four cloud scripts:
-
-- `scripts/cloud/setup_vm.sh` creates the Python environment and verifies CUDA.
-- `scripts/cloud/run_development_pipeline.sh` runs training, validation inference,
-  and threshold calibration without official-test inference.
-- `scripts/cloud/run_final_test.sh` performs the one-time official-test inference,
-  fusion, and evaluation after the development pipeline is frozen.
-- `scripts/cloud/run_lopo_pipeline.sh` runs three held-out-plane experiments using
-  official-training data only.
-
-After the GPU VM starts, connect to it and prepare the repository:
-
-```bash
-git clone https://github.com/XiaoyeLeung/brainTumor.git
-cd brainTumor
-bash scripts/cloud/setup_vm.sh
-```
-
-Copy the local `brisc2025/` directory into `~/brainTumor/` on the VM, then
-verify it:
-
-```bash
-source .venv-cloud/bin/activate
-python src/verify_dataset.py
-```
-
-Start development training in a persistent background process:
-
-```bash
-nohup bash scripts/cloud/run_development_pipeline.sh > cloud-run.log 2>&1 < /dev/null &
-tail -f cloud-run.log
-```
-
-The development run performs:
-
-```text
-full split -> classification training -> segmentation training
--> validation inference -> validation threshold calibration
-```
-
-Segmentation training uses a false-positive-aware Tversky loss, gives extra BCE
-weight to no-tumor images, and selects checkpoints using the mean of tumor Dice
-and empty-mask specificity. Inference removes connected components smaller than
-64 pixels and clears masks when the classifier assigns at least 0.90 probability
-to `no_tumor`. The validation run records these post-processing settings in
-`thresholds.json`; final-test and LOPO inference load that configuration rather
-than duplicating it.
-
-The defaults can be overridden before a development run:
-
-```bash
-BRAINTUMOR_SEGMENTATION_FP_WEIGHT=0.7 \
-BRAINTUMOR_EMPTY_MASK_WEIGHT=2.0 \
-BRAINTUMOR_MIN_COMPONENT_PIXELS=64 \
-BRAINTUMOR_NO_TUMOR_GATE_THRESHOLD=0.9 \
-bash scripts/cloud/run_development_pipeline.sh
-```
-
-It records the Python environment, GPU information, Git commit, checkpoints,
-validation predictions, thresholds, and a combined pipeline log. It does not run
-inference on official-test images.
-
-After all development decisions are frozen, run the official test exactly once:
-
-```bash
-bash scripts/cloud/run_final_test.sh
-```
-
-The final evaluation uses all 1,000 official-test images. Do not tune the model
-after viewing the result.
-
-After training, download `results/` and `checkpoints/` before stopping the VM.
-Stopping the VM stops GPU and CPU charges, but its persistent disk continues to
-incur storage charges.
+Train and validate on images from axial, coronal, and sagittal planes. Evaluate on the official test set after development choices are frozen.
 
 ## Leave-one-plane-out experiment
 
@@ -109,19 +11,33 @@ held out for evaluation while the other two planes provide training and
 validation data. Early stopping and threshold calibration never see the held-out
 plane, and official-test rows are excluded.
 
-Run all three folds sequentially on the VM:
+## Size-matched all-plane control
 
-```bash
-nohup bash scripts/cloud/run_lopo_pipeline.sh > lopo-run.log 2>&1 < /dev/null &
-tail -f lopo-run.log
-```
+Create a LOPO split and an equal-size all-plane split with the same official-test
+target-plane images.
 
-To run only one fold, set `BRAINTUMOR_LOPO_PLANES`, for example:
+# Code
 
-```bash
-BRAINTUMOR_LOPO_PLANES=axial bash scripts/cloud/run_lopo_pipeline.sh
-```
+## Source code
 
-Each fold writes `heldout_metrics.json` and `heldout_fusion.json` under
-`results/leave_<plane>_out_seed42/reports/`. The official-test pipeline remains
-a separate, explicit final step.
+- [calibrate_thresholds.py](src/calibrate_thresholds.py) Selects fusion thresholds from validation predictions.
+- [compare_segmentation_runs.py](src/compare_segmentation_runs.py) Compares segmentation results from two runs.
+- [data.py](src/data.py) Loads datasets, aligns masks, and defines image transforms.
+- [decision_fusion.py](src/decision_fusion.py) Combines classifier and segmenter predictions.
+- [evaluate.py](src/evaluate.py) Calculates final evaluation metrics.
+- [models.py](src/models.py) Defines the neural network models
+- [predict.py](src/predict.py) Runs saved models and exports predictions.
+- [prepare_plane_split.py](src/prepare_plane_split.py) Creates plane-based experiment splits.
+- [pretrain_segmentation.py](src/pretrain_segmentation.py) Pretrains U-Net through masked image reconstruction.
+- [runtime.py](src/runtime.py) Handles seeds, devices, run paths, and reports.
+- [segmentation_postprocessing.py](src/segmentation_postprocessing.py) Filters predicted masks and applies classifier gating.
+- [train_classification.py](src/train_classification.py) — Trains the classifier
+- [train_segmentation.py](src/train_segmentation.py) Trains segmenter
+- [verify_dataset.py](src/verify_dataset.py) — Checks dataset files against the manifest
+
+## Google Cloud
+
+- `scripts/cloud/setup_vm.sh` set up environment on gcloud
+- `scripts/cloud/run_development_pipeline.sh` runs training, validation without test set
+- `scripts/cloud/run_final_test.sh` run the model on test set after the development pipeline is frozen.
+- `scripts/cloud/run_lopo_pipeline.sh` runs three LOPO experiments

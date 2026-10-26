@@ -10,10 +10,11 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
 from data import (
+    SEGMENTATION_AUGMENTATION_PROFILES,
     SegmentationDataset,
     build_segmentation_transforms,
     build_train_validation_loaders,
-    load_segmentation_frames,
+    load_segmentation_frame,
 )
 from models import UNet
 from runtime import (
@@ -31,6 +32,11 @@ from segmentation_postprocessing import (
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ENCODER_PREFIXES = ("inc.", "down1.", "down2.", "down3.", "down4.")
 DECODER_PREFIXES = ("up1.", "up2.", "up3.", "up4.")
+CHECKPOINT_METRICS = {
+    "positive_dice": "positive_dice",
+    "balanced_dice": "balanced_dice",
+    "overall_dice": "dice",
+}
 
 
 def load_pretrained_unet(
@@ -38,8 +44,8 @@ def load_pretrained_unet(
     checkpoint_path: Path,
     device: torch.device,
     scope: str = "encoder_decoder",
+    expected_excluded_plane: str | None = None,
 ) -> dict[str, object]:
-    """Load train-only reconstruction weights without loading the output head."""
     if scope not in {"encoder", "encoder_decoder"}:
         raise ValueError("scope must be 'encoder' or 'encoder_decoder'")
 
@@ -48,6 +54,26 @@ def load_pretrained_unet(
         raise ValueError(
             "Pretraining checkpoint is missing train-only provenance metadata"
         )
+    if expected_excluded_plane is not None:
+        checkpoint_excluded_plane = checkpoint.get("pretraining_excluded_plane")
+        if checkpoint_excluded_plane != expected_excluded_plane:
+            raise ValueError(
+                "Pretraining checkpoint excluded-plane provenance does not match "
+                f"the LOPO fold: {checkpoint_excluded_plane!r} != "
+                f"{expected_excluded_plane!r}"
+            )
+        source_planes = set(checkpoint.get("pretraining_source_planes", ()))
+        expected_source_planes = {
+            "axial",
+            "coronal",
+            "sagittal",
+        } - {expected_excluded_plane}
+        if source_planes != expected_source_planes:
+            raise ValueError(
+                "Pretraining checkpoint source-plane provenance is invalid for "
+                f"held-out {expected_excluded_plane!r}: "
+                f"{sorted(source_planes)} != {sorted(expected_source_planes)}"
+            )
 
     pretraining_config = checkpoint.get("config", {})
     if bool(pretraining_config.get("bilinear", False)) != model.bilinear:
@@ -89,6 +115,8 @@ def load_pretrained_unet(
         "transferred_tensor_count": len(transferred),
         "pretraining_epoch": checkpoint.get("epoch"),
         "pretraining_val_masked_l1": checkpoint.get("val_masked_l1"),
+        "pretraining_source_planes": checkpoint.get("pretraining_source_planes", []),
+        "pretraining_excluded_plane": checkpoint.get("pretraining_excluded_plane"),
         "output_head_reinitialized": True,
     }
 
@@ -106,13 +134,13 @@ def soft_dice_loss(
     return 1.0 - dice.mean()
 
 
+# loss with extra weight on false-positive pixels
 def soft_tversky_loss(
     logits: torch.Tensor,
     targets: torch.Tensor,
     false_positive_weight: float = 0.7,
     smooth: float = 1e-6,
 ) -> torch.Tensor:
-    """Asymmetric overlap loss with extra weight on false-positive pixels."""
     if not 0.0 <= false_positive_weight <= 1.0:
         raise ValueError("false_positive_weight must be in [0, 1]")
     probabilities = torch.sigmoid(logits)
@@ -137,7 +165,6 @@ def segmentation_loss(
     false_positive_weight: float = 0.7,
     empty_mask_weight: float = 2.0,
 ) -> torch.Tensor:
-    """Combine empty-mask-weighted BCE and false-positive-aware Tversky loss."""
     if not 0.0 <= bce_weight <= 1.0:
         raise ValueError("bce_weight must be in [0, 1]")
     if empty_mask_weight < 1.0:
@@ -184,7 +211,6 @@ def dice_coefficient(
     targets: torch.Tensor,
     threshold: float = 0.5,
 ) -> torch.Tensor:
-    """Mean hard Dice score for a batch of binary masks."""
     return _binary_overlap(logits, targets, threshold, metric="dice")
 
 
@@ -193,7 +219,6 @@ def iou_coefficient(
     targets: torch.Tensor,
     threshold: float = 0.5,
 ) -> torch.Tensor:
-    """Mean intersection-over-union score for binary masks."""
     return _binary_overlap(logits, targets, threshold, metric="iou")
 
 
@@ -207,6 +232,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--run-name", type=validate_run_name)
     parser.add_argument("--image-size", type=int, default=256)
+    parser.add_argument(
+        "--augmentation-profile",
+        choices=SEGMENTATION_AUGMENTATION_PROFILES,
+        default="t2",
+        help="Training augmentation recipe; validation transforms stay deterministic.",
+    )
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -234,6 +265,14 @@ def parse_args() -> argparse.Namespace:
         default="encoder_decoder",
         help="Pretrained U-Net blocks to transfer; the output head is always new.",
     )
+    parser.add_argument(
+        "--expected-pretraining-excluded-plane",
+        choices=("axial", "coronal", "sagittal"),
+        help=(
+            "Require the initialization checkpoint to prove that this LOPO "
+            "target plane was excluded during pretraining."
+        ),
+    )
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument(
         "--bce-weight",
@@ -255,7 +294,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--selection-metric",
-        choices=("positive_dice", "balanced_dice"),
+        choices=tuple(CHECKPOINT_METRICS),
         default="balanced_dice",
         help="Validation metric used for checkpoint selection and early stopping.",
     )
@@ -269,6 +308,13 @@ def parse_args() -> argparse.Namespace:
         help="Stop after PATIENCE non-improving validation epochs (default: 5).",
     )
     args = parser.parse_args()
+    if (
+        args.expected_pretraining_excluded_plane is not None
+        and args.initial_checkpoint is None
+    ):
+        parser.error(
+            "--expected-pretraining-excluded-plane requires --initial-checkpoint"
+        )
     if args.early_stopping is not None and args.early_stopping < 1:
         parser.error("--earlyStopping PATIENCE must be at least 1")
     if not 0.0 <= args.threshold <= 1.0:
@@ -337,7 +383,9 @@ def run_segmentation_epoch(
             if positive.any():
                 count = int(positive.sum())
                 totals["positive_dice"] += (
-                    dice_coefficient(logits[positive], masks[positive], threshold).item()
+                    dice_coefficient(
+                        logits[positive], masks[positive], threshold
+                    ).item()
                     * count
                 )
                 positive_count += count
@@ -409,9 +457,7 @@ def collect_segmentation_predictions(
             predicted_area = predicted_masks.sum(dim=dimensions).float()
             target_area = target_masks.sum(dim=dimensions).float()
             union = predicted_area + target_area - intersection
-            dice = (2.0 * intersection + 1e-6) / (
-                predicted_area + target_area + 1e-6
-            )
+            dice = (2.0 * intersection + 1e-6) / (predicted_area + target_area + 1e-6)
             iou = (intersection + 1e-6) / (union + 1e-6)
             areas = predicted_masks.float().mean(dim=dimensions)
             target_areas = target_masks.float().mean(dim=dimensions)
@@ -446,10 +492,12 @@ def main() -> None:
 
     seed_everything(args.seed)
     device = select_device(args.device)
-    train_frame, validation_frame = load_segmentation_frames(args.split_root)
+    train_frame = load_segmentation_frame(args.split_root, "train")
+    validation_frame = load_segmentation_frame(args.split_root, "validation")
 
     train_transform, validation_transform = build_segmentation_transforms(
-        args.image_size
+        args.image_size,
+        args.augmentation_profile,
     )
 
     train_dataset = SegmentationDataset(train_frame, args.data_root, train_transform)
@@ -482,12 +530,15 @@ def main() -> None:
                 args.initial_checkpoint,
                 device,
                 args.initialization_scope,
+                args.expected_pretraining_excluded_plane,
             ),
         }
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     history: list[dict[str, float | int]] = []
     best_score = -1.0
     best_epoch = 0
+    best_scores = {name: -1.0 for name in CHECKPOINT_METRICS}
+    best_epochs = {name: 0 for name in CHECKPOINT_METRICS}
     epochs_without_improvement = 0
     upsampling = "bilinear" if args.bilinear else "transposed"
     description = (
@@ -500,6 +551,7 @@ def main() -> None:
     print(
         f"Device: {device}; train={len(train_dataset)}, validation={len(validation_dataset)}"
     )
+    print(f"Segmentation augmentation profile: {args.augmentation_profile}")
     if args.initial_checkpoint is not None:
         print(
             "Initialized U-Net from masked pretraining: "
@@ -544,21 +596,39 @@ def main() -> None:
             f"balanced Dice={validation_metrics['balanced_dice']:.4f}"
         )
 
-        selection_score = validation_metrics[args.selection_metric]
+        checkpoint_payload = {
+            "model_state_dict": model.state_dict(),
+            "epoch": epoch,
+            "val_positive_dice": validation_metrics["positive_dice"],
+            "val_metrics": validation_metrics,
+            "initialization": initialization,
+            "config": config,
+        }
+        for checkpoint_name, metric_key in CHECKPOINT_METRICS.items():
+            metric_score = validation_metrics[metric_key]
+            if metric_score > best_scores[checkpoint_name]:
+                best_scores[checkpoint_name] = metric_score
+                best_epochs[checkpoint_name] = epoch
+                torch.save(
+                    {
+                        **checkpoint_payload,
+                        "selection_metric": checkpoint_name,
+                        "selection_score": metric_score,
+                    },
+                    run.checkpoint_dir / f"best_{checkpoint_name}.pt",
+                )
+
+        selection_key = CHECKPOINT_METRICS[args.selection_metric]
+        selection_score = validation_metrics[selection_key]
         if selection_score > best_score:
             best_score = selection_score
             best_epoch = epoch
             epochs_without_improvement = 0
             torch.save(
                 {
-                    "model_state_dict": model.state_dict(),
-                    "epoch": epoch,
-                    "val_positive_dice": validation_metrics["positive_dice"],
-                    "val_metrics": validation_metrics,
+                    **checkpoint_payload,
                     "selection_metric": args.selection_metric,
                     "selection_score": selection_score,
-                    "initialization": initialization,
-                    "config": config,
                 },
                 run.checkpoint_path,
             )
@@ -592,6 +662,14 @@ def main() -> None:
         "epochs_completed": len(history),
         "early_stopping_patience": args.early_stopping,
         "checkpoint": str(run.checkpoint_path),
+        "checkpoints": {
+            name: {
+                "path": str(run.checkpoint_dir / f"best_{name}.pt"),
+                "epoch": best_epochs[name],
+                "score": best_scores[name],
+            }
+            for name in CHECKPOINT_METRICS
+        },
         "initialization": initialization,
         "config": config,
     }

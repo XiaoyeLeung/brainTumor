@@ -1,4 +1,4 @@
-# Non-PyTorch dependencies for the Google Cloud GPU environment.
+#google cloud environment 
 
 albumentations==2.0.8
 numpy==2.5.4

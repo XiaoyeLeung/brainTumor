@@ -24,4 +24,3 @@ env/
 *.md
 cloud_artifacts/
 .firecrawl/
-README.md

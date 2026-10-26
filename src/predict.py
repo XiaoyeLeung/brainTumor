@@ -7,6 +7,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from data import (
+    CLASS_NAMES,
     EXPERIMENT_SPLITS,
     ClassificationDataset,
     SegmentationDataset,
@@ -123,7 +124,7 @@ def main() -> None:
         class_names = tuple(
             checkpoint.get(
                 "class_names",
-                ("glioma", "meningioma", "no_tumor", "pituitary"),
+                CLASS_NAMES,
             )
         )
         image_size = int(config.get("image_size", 224))

@@ -150,32 +150,32 @@ def build_reconstruction_transforms(
     return train_transform, validation_transform
 
 
-def build_segmentation_transforms(image_size: int) -> tuple[object, object]:
+SEGMENTATION_AUGMENTATION_PROFILES = ("mild", "t2")
+
+
+def build_segmentation_transforms(
+    image_size: int,
+    augmentation_profile: str = "t2",
+) -> tuple[object, object]:
+    """Build paired segmentation transforms for a named augmentation profile."""
+    if augmentation_profile not in SEGMENTATION_AUGMENTATION_PROFILES:
+        raise ValueError(
+            "augmentation_profile must be one of "
+            f"{SEGMENTATION_AUGMENTATION_PROFILES}"
+        )
+
     os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
     import albumentations as A
     import cv2
     from albumentations.pytorch import ToTensorV2
 
-    # train_transform = A.Compose(
-    #     [
-    #         A.Resize(image_size, image_size),
-    #         A.HorizontalFlip(p=0.5),
-    #         A.Rotate(limit=10, border_mode=cv2.BORDER_CONSTANT, p=0.5),
-    #         A.Normalize(mean=(0.5,), std=(0.5,)),
-    #         ToTensorV2(),
-    #     ]
-    # )
-    # validation_transform = A.Compose(
-    #     [
-    #         A.Resize(image_size, image_size),
-    #         A.Normalize(mean=(0.5,), std=(0.5,)),
-    #         ToTensorV2(),
-    #     ]
-    # )
-
-    train_transform2 = A.Compose(
-        [
-            A.Resize(image_size, image_size),
+    if augmentation_profile == "mild":
+        augmentation = [
+            A.HorizontalFlip(p=0.5),
+            A.Rotate(limit=10, border_mode=cv2.BORDER_CONSTANT, p=0.5),
+        ]
+    else:
+        augmentation = [
             A.HorizontalFlip(p=0.5),
             A.Affine(
                 scale=(0.90, 1.10),
@@ -207,22 +207,28 @@ def build_segmentation_transforms(image_size: int) -> tuple[object, object]:
                 ],
                 p=0.15,
             ),
+        ]
+
+    train_transform = A.Compose(
+        [
+            A.Resize(image_size, image_size),
+            *augmentation,
             A.Normalize(mean=(0.5,), std=(0.5,)),
             ToTensorV2(),
         ]
     )
-    validation_transform2 = A.Compose(
+    validation_transform = A.Compose(
         [
             A.Resize(image_size, image_size),
             A.Normalize(mean=(0.5,), std=(0.5,)),
             ToTensorV2(),
         ]
     )
-    return train_transform2, validation_transform2
+    return train_transform, validation_transform
 
 
 def load_classification_frame(split_root: Path, split: str) -> pd.DataFrame:
-    """Load one classification split from an experiment manifest or legacy CSV."""
+    """load one classification split"""
     if split not in EXPERIMENT_SPLITS:
         raise ValueError(f"split must be one of {EXPERIMENT_SPLITS}")
 
@@ -248,21 +254,10 @@ def load_classification_frame(split_root: Path, split: str) -> pd.DataFrame:
     return result
 
 
-def load_classification_frames(
-    split_root: Path,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Load and validate classification train and validation rows."""
-    return (
-        load_classification_frame(split_root, "train"),
-        load_classification_frame(split_root, "validation"),
-    )
-
-
 def load_segmentation_frame(split_root: Path, split: str) -> pd.DataFrame:
     """Load one aligned segmentation split."""
     classification = load_classification_frame(split_root, split)
     if "mask_relative_path" in classification.columns:
-        _validate_frame_columns(classification, {"mask_relative_path"}, split)
         return classification
 
     legacy_names = {
@@ -278,16 +273,6 @@ def load_segmentation_frame(split_root: Path, split: str) -> pd.DataFrame:
         split,
     )
     return build_aligned_segmentation_frame(classification, segmentation)
-
-
-def load_segmentation_frames(
-    split_root: Path,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Load aligned segmentation train and validation rows."""
-    return (
-        load_segmentation_frame(split_root, "train"),
-        load_segmentation_frame(split_root, "validation"),
-    )
 
 
 def build_aligned_segmentation_frame(
@@ -330,17 +315,6 @@ def build_aligned_segmentation_frame(
             raise ValueError("Classification and segmentation image hashes differ")
         aligned = aligned.drop(columns="mask_image_sha256")
     return aligned
-
-
-def _validate_split_columns(
-    train_frame: pd.DataFrame,
-    validation_frame: pd.DataFrame,
-    required_columns: set[str],
-) -> None:
-    if missing := required_columns - set(train_frame.columns):
-        raise ValueError(f"Training CSV is missing columns: {sorted(missing)}")
-    if missing := required_columns - set(validation_frame.columns):
-        raise ValueError(f"Validation CSV is missing columns: {sorted(missing)}")
 
 
 def _validate_frame_columns(
